@@ -13,6 +13,17 @@ export function mainWorktree(cwd: string): string {
   return realpathSync(dirname(r.stdout.toString().trim()));
 }
 
+/** The branch and worktree `cwd` is in (null outside a branch, e.g. detached). */
+export function whereAmI(cwd: string): { branch: string | null; worktree: string | null } {
+  const git = (args: string[]) => {
+    const r = Bun.spawnSync(["git", "-C", cwd, ...args]);
+    return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+  };
+  const branch = git(["symbolic-ref", "--short", "-q", "HEAD"]);
+  const top = git(["rev-parse", "--show-toplevel"]);
+  return { branch: branch || null, worktree: top ? realpathSync(top) : null };
+}
+
 function baseSlug(name: string): string {
   const letters = name.toUpperCase().replace(/[^A-Z0-9]/g, "");
   return (letters || "REPO").slice(0, 4);

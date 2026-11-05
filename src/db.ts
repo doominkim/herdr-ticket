@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, linkSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { TAG_COLORS } from "../mods/herdr-ticket/tag-colors.js";
 
 export function dbPath(): string {
   return process.env.HERDR_TICKET_DB || join(homedir(), ".local", "share", "herdr-ticket", "tickets.db");
@@ -63,6 +64,38 @@ const MIGRATIONS = [
   // The Herdr terminal that last worked on the ticket (HC_TERMINAL_ID of the writer, or `tk link`).
   `ALTER TABLE tickets ADD COLUMN session_terminal TEXT;
    ALTER TABLE tickets ADD COLUMN session_at INTEGER;`,
+  // Creation origin is immutable; old tickets remain unknown rather than being backfilled.
+  `ALTER TABLE tickets ADD COLUMN created_branch TEXT;
+   ALTER TABLE tickets ADD COLUMN created_worktree TEXT;`,
+  `ALTER TABLE tickets ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';`,
+  // One-level child tickets retain their own lifecycle; existing tickets stay roots.
+  `ALTER TABLE tickets ADD COLUMN parent_id INTEGER REFERENCES tickets(id);
+   CREATE INDEX tickets_parent ON tickets (parent_id);`,
+  // Catalog definitions outlive ticket usage. Backfill before adding revision triggers so opening an
+  // old database preserves its revision and every existing row, including ticket tag array order.
+  `CREATE TABLE repo_tags (
+     id INTEGER PRIMARY KEY,
+     repo_id INTEGER NOT NULL REFERENCES repos(id),
+     name TEXT NOT NULL,
+     color TEXT NOT NULL CHECK (color IN (${TAG_COLORS.map(color => `'${color}'`).join(", ")})),
+     UNIQUE (repo_id, name)
+   );
+   WITH appearances AS (
+     SELECT t.repo_id, j.value AS name, t.id AS ticket_id, CAST(j.key AS INTEGER) AS tag_index,
+       ROW_NUMBER() OVER (PARTITION BY t.repo_id, j.value ORDER BY t.id, CAST(j.key AS INTEGER)) AS occurrence
+     FROM tickets t, json_each(t.tags) j
+   ), ordered AS (
+     SELECT repo_id, name,
+       ROW_NUMBER() OVER (PARTITION BY repo_id ORDER BY ticket_id, tag_index) - 1 AS color_index
+     FROM appearances WHERE occurrence = 1
+   )
+   INSERT INTO repo_tags (repo_id, name, color)
+     SELECT repo_id, name, CASE color_index % ${TAG_COLORS.length}
+       ${TAG_COLORS.map((color, index) => `WHEN ${index} THEN '${color}'`).join("\n       ")}
+     END FROM ordered ORDER BY repo_id, color_index;
+   ${["INSERT", "UPDATE", "DELETE"].map(op =>
+     `CREATE TRIGGER rev_repo_tags_${op.toLowerCase()} AFTER ${op} ON repo_tags
+      BEGIN UPDATE meta SET value = value + 1 WHERE key = 'rev'; END;`).join("\n")}`,
 ];
 
 export function rev(db: Database): number {

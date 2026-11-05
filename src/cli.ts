@@ -5,6 +5,7 @@ import { openDb, rev } from "./db";
 import { addHandoff, listHandoffs } from "./handoffs";
 import { repoFor, resolveRef, setSlug, TkError, type Repo } from "./repo";
 import { attachSession, createTicket, deleteTicket, editTicket, getTicket, listTickets, OPEN_STATUSES, setStatus, STATUSES, ticketEvents } from "./tickets";
+import { listTags } from "./tags";
 
 type Args = { _: string[]; flags: Record<string, string | true> };
 
@@ -12,6 +13,10 @@ function parse(argv: string[]): Args {
   const out: Args = { _: [], flags: {} };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
+    if (a.startsWith("--tags=")) {
+      out.flags.tags = a.slice("--tags=".length);
+      continue;
+    }
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
@@ -31,15 +36,32 @@ async function text(flags: Args["flags"], key: string): Promise<string> {
   return typeof v === "string" ? v : "";
 }
 
+function tagNames(flags: Args["flags"]): string[] | undefined {
+  const value = flags.tags;
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new TkError("--tags needs a comma-separated value (use an empty string to clear)");
+  return value.trim() ? value.split(",") : [];
+}
+
+function parentRef(flags: Args["flags"]): string | undefined {
+  const value = flags.parent;
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new TkError("--parent needs a ticket reference");
+  return value;
+}
+
 const HELP = `tk — tickets and handoffs per repository (its original main worktree, from any worktree)
 
   tk brief                         open tickets of this repo, each with its latest handoff
-  tk new <title> [--body -]        issue a ticket (todo); empty body gets the Goal / Done when template
-  tk ls [--status S] [--terminal T] [--all-repos]
-                                   list tickets (--terminal: the ones that terminal works on)
-  tk show <ref>                    body, status history, handoffs (newest first)
+  tk new <title> [--body -] [--tags bug,fix] [--parent REF]
+                                   issue a ticket (todo); empty body gets the Goal / Done when template
+  tk ls [--status S] [--terminal T] [--all-repos | --parent REF]
+                                   list summaries (--parent: direct children, all statuses unless filtered)
+  tk show <ref> [--latest-handoff]  body, parent, children and newest handoff; full history in JSON by default
+                                   --latest-handoff: only newest handoff, no events in JSON
   tk status <ref> <status>         todo | in_progress | in_review | done | canceled
-  tk edit <ref> [--title T] [--body -]
+  tk edit <ref> [--title T] [--body -] [--tags bug,fix]
+  tk tags                          this repo's persistent tag catalog, with stable colors
   tk link <ref> --terminal T       attach a Herdr terminal as the ticket's session
   tk delete <ref> --yes            remove a ticket with its handoffs and history (numbers are not reused)
   tk handoff <ref> --summary S --body -
@@ -49,9 +71,13 @@ const HELP = `tk — tickets and handoffs per repository (its original main work
 
   <ref>       MAIN-12, or 12 for this repo
   --body -    read the text from standard input
+  --tags      replace tags: comma-separated, 0-8 unique names of 1-32 ASCII letters/digits/hyphens; "" clears
+  --parent    a root ticket in this repo; children have independent states and cannot have children
+              parents with any children cannot be deleted; --all-repos and --parent cannot combine
   Agents add --provider P --model M [--session S] to every write; inside an agent it is required.
   Inside a Herdr terminal ($HC_TERMINAL_ID) every write attaches that terminal as the ticket's session.
-  --json      machine-readable output     --cwd DIR   act as if run in DIR
+  --json      compact JSON output        --pretty    indented JSON (implies --json)
+  --cwd DIR   act as if run in DIR
   Database: $HERDR_TICKET_DB or ~/.local/share/herdr-ticket/tickets.db`;
 
 async function main(argv: string[]): Promise<number> {
@@ -61,9 +87,10 @@ async function main(argv: string[]): Promise<number> {
     console.log(HELP);
     return 0;
   }
-  const asJson = args.flags.json === true;
+  const pretty = args.flags.pretty === true;
+  const asJson = args.flags.json === true || pretty;
   const cwd = typeof args.flags.cwd === "string" ? args.flags.cwd : process.cwd();
-  const print = (data: unknown, out: string) => console.log(asJson ? JSON.stringify(data) : out);
+  const print = (data: unknown, out: string) => console.log(asJson ? JSON.stringify(data, null, pretty ? 2 : undefined) : out);
   const db = openDb();
   const repo = () => repoFor(db, cwd);
   // Inside a Herdr terminal, whatever this write touches gets that terminal as its session.
@@ -73,11 +100,16 @@ async function main(argv: string[]): Promise<number> {
   switch (cmd) {
     case "new": {
       const title = rest.join(" ").trim();
-      if (!title) throw new TkError("usage: tk new <title> [--body -] [--provider P --model M --session S]");
+      if (!title) throw new TkError("usage: tk new <title> [--body -] [--tags bug,fix] [--parent REF] [--provider P --model M --session S]");
       const author = resolveAuthor(args.flags, process.env);
-      const r = repo();
-      const t = attach(r, createTicket(db, r, { title, body: await text(args.flags, "body"), author }).number);
-      print(t, `${t.ref}  ${t.title}`);
+      const body = await text(args.flags, "body");
+      const tags = tagNames(args.flags);
+      const parent = parentRef(args.flags);
+      const t = db.transaction(() => {
+        const r = repo();
+        return attach(r, createTicket(db, r, { title, body, author, cwd, tags, parentRef: parent }).number);
+      }).immediate();
+      print(t, `${t.ref}  ${t.title}${t.tags.length ? `  #${t.tags.join(" #")}` : ""}`);
       return 0;
     }
     case "status": {
@@ -92,16 +124,22 @@ async function main(argv: string[]): Promise<number> {
     }
     case "show": {
       const [ref] = rest;
-      if (!ref) throw new TkError("usage: tk show <ref>");
+      if (!ref) throw new TkError("usage: tk show <ref> [--latest-handoff]");
       const { repo: r, number } = resolveRef(db, ref, cwd);
       const t = getTicket(db, r, number);
       if (!t) throw new TkError(`no such ticket: ${ref}`);
-      const events = ticketEvents(db, r, number);
-      const handoffs = listHandoffs(db, r, number);
+      const latestOnly = args.flags["latest-handoff"] === true;
+      const handoffs = listHandoffs(db, r, number, latestOnly);
+      const children = listTickets(db, r, undefined, undefined, true, number);
       const latest = handoffs[0];
-      const text = [`${t.ref}  [${t.status}]  ${t.title}`, "", t.body.trimEnd()];
-      if (latest) text.push("", `--- latest handoff (of ${handoffs.length}) ---`, latest.summary, "", latest.body.trimEnd());
-      print({ ...t, events, handoffs }, text.join("\n"));
+      const text = [`${t.ref}  [${t.status}]  ${t.title}`];
+      if (t.tags.length) text.push(`Tags: ${t.tags.join(", ")}`);
+      if (t.parent_ref) text.push(`Parent: ${t.parent_ref}`);
+      if (children.length) text.push("Children:", ...children.map(child => `  ${child.ref}  [${child.status}]  ${child.title}`));
+      if (t.created_worktree) text.push(`Created in: ${t.created_branch ?? "(detached HEAD)"} · ${t.created_worktree}`);
+      text.push("", t.body.trimEnd());
+      if (latest) text.push("", latestOnly ? "--- latest handoff ---" : `--- latest handoff (of ${handoffs.length}) ---`, latest.summary, "", latest.body.trimEnd());
+      print({ ...t, children, ...(!latestOnly ? { events: ticketEvents(db, r, number) } : {}), handoffs }, text.join("\n"));
       return 0;
     }
     case "handoff": {
@@ -117,11 +155,27 @@ async function main(argv: string[]): Promise<number> {
     }
     case "ls": {
       const all = args.flags["all-repos"] === true;
-      const r = all ? null : repo();
+      if (all && args.flags.parent !== undefined) throw new TkError("--all-repos cannot be combined with --parent");
+      const parent = parentRef(args.flags);
+      const scope = () => {
+        const r = all ? null : repo();
+        if (parent === undefined) return { r, parentNumber: undefined };
+        const resolved = resolveRef(db, parent, cwd);
+        if (r?.id !== resolved.repo.id) throw new TkError("parent must belong to the current repository");
+        if (!getTicket(db, resolved.repo, resolved.number)) throw new TkError(`no such ticket: ${parent}`);
+        return { r, parentNumber: resolved.number };
+      };
+      const { r, parentNumber } = parent === undefined ? scope() : db.transaction(scope).immediate();
       const status = typeof args.flags.status === "string" ? args.flags.status : undefined;
       const terminal = typeof args.flags.terminal === "string" ? args.flags.terminal : undefined;
-      const tickets = listTickets(db, r, status, terminal);
-      print({ repo: r, tickets }, tickets.map((t) => `${t.ref}  [${t.status}]  ${t.title}`).join("\n"));
+      const tickets = listTickets(db, r, status, terminal, true, parentNumber);
+      print({ repo: r, tickets }, tickets.map((t) => `${t.ref}  [${t.status}]  ${t.title}${t.tags.length ? `  #${t.tags.join(" #")}` : ""}`).join("\n"));
+      return 0;
+    }
+    case "tags": {
+      const r = repo();
+      const tags = listTags(db, r);
+      print({ repo: r, tags }, tags.map(tag => `${tag.name}  ${tag.color}`).join("\n"));
       return 0;
     }
     case "brief": {
@@ -129,22 +183,23 @@ async function main(argv: string[]): Promise<number> {
       const r = repo();
       const tickets = listTickets(db, r)
         .filter((t) => OPEN_STATUSES.includes(t.status))
-        .map((t) => ({ ...t, latest_handoff: listHandoffs(db, r, t.number)[0] ?? null }));
+        .map((t) => ({ ...t, latest_handoff: listHandoffs(db, r, t.number, true)[0] ?? null }));
       const lines = tickets.map((t) => {
         const h = t.latest_handoff;
-        return `${t.ref}  [${t.status}]  ${t.title}${h ? `\n    └ ${h.summary}` : ""}`;
+        return `${t.ref}  [${t.status}]  ${t.title}${t.tags.length ? `  #${t.tags.join(" #")}` : ""}${h ? `\n    └ ${h.summary}` : ""}`;
       });
       print({ repo: r, tickets }, [`${r.slug}  ${r.root}`, ...lines].join("\n"));
       return 0;
     }
     case "edit": {
       const [ref] = rest;
-      if (!ref) throw new TkError("usage: tk edit <ref> [--title T] [--body -]");
+      if (!ref) throw new TkError("usage: tk edit <ref> [--title T] [--body -] [--tags bug,fix]");
       const { repo: r, number } = resolveRef(db, ref, cwd);
       const actor = actorName(resolveAuthor(args.flags, process.env));
       const change = {
         ...(typeof args.flags.title === "string" ? { title: args.flags.title } : {}),
         ...(args.flags.body !== undefined ? { body: await text(args.flags, "body") } : {}),
+        ...(args.flags.tags !== undefined ? { tags: tagNames(args.flags) } : {}),
       };
       editTicket(db, r, number, change, actor);
       const t = attach(r, number);

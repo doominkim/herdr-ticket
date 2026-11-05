@@ -8,7 +8,7 @@ dest="$mods/herdr-ticket"
 tmp="$(dirname "$mods")/.herdr-ticket.new.$$" # outside mods/: the app never sees it half-made
 rm -rf "$tmp"
 mkdir -p "$tmp"
-cp "$here/mods/herdr-ticket/mod.json" "$here/mods/herdr-ticket/main.js" "$tmp/"
+cp "$here/mods/herdr-ticket/mod.json" "$here/mods/herdr-ticket/"*.js "$tmp/"
 [ -d "$dest" ] && cp "$dest"/gpui-kit.d.ts "$dest"/jsconfig.json "$tmp/" 2>/dev/null || true
 rm -rf "$dest.old"
 [ -d "$dest" ] && mv "$dest" "$dest.old"

@@ -1,7 +1,6 @@
 import type { Database } from "bun:sqlite";
-import { realpathSync } from "node:fs";
 import type { Author } from "./author";
-import { TkError, type Repo } from "./repo";
+import { TkError, whereAmI, type Repo } from "./repo";
 
 export type Handoff = {
   summary: string;
@@ -31,16 +30,6 @@ export function validateHandoff(summary: string, body: string): void {
   }
 }
 
-/** The branch and worktree `cwd` is in (null outside a branch, e.g. detached). */
-function whereAmI(cwd: string): { branch: string | null; worktree: string | null } {
-  const git = (args: string[]) => {
-    const r = Bun.spawnSync(["git", "-C", cwd, ...args]);
-    return r.exitCode === 0 ? r.stdout.toString().trim() : null;
-  };
-  const branch = git(["symbolic-ref", "--short", "-q", "HEAD"]);
-  const top = git(["rev-parse", "--show-toplevel"]);
-  return { branch: branch || null, worktree: top ? realpathSync(top) : null };
-}
 
 export function addHandoff(
   db: Database,
@@ -64,13 +53,13 @@ export function addHandoff(
   }).immediate();
 }
 
-/** Newest first. */
-export function listHandoffs(db: Database, repo: Repo, number: number): Handoff[] {
+/** Newest first; latest-only reads fetch at most one row. */
+export function listHandoffs(db: Database, repo: Repo, number: number, latestOnly = false): Handoff[] {
   return db
     .query(
       `SELECT h.summary, h.body, h.branch, h.worktree, h.created_by, h.provider, h.model, h.session_id, h.created_at
        FROM handoffs h JOIN tickets t ON t.id = h.ticket_id
-       WHERE t.repo_id = ? AND t.number = ? ORDER BY h.id DESC`,
+       WHERE t.repo_id = ? AND t.number = ? ORDER BY h.id DESC${latestOnly ? " LIMIT 1" : ""}`,
     )
     .all(repo.id, number) as Handoff[];
 }

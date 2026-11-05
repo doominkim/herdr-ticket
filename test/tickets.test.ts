@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { sandbox } from "./helpers";
 
 let sb: ReturnType<typeof sandbox>;
@@ -13,6 +14,68 @@ describe("repository", () => {
 
     expect(list.repo.root).toBe(sb.main);
     expect(list.tickets.map((t: any) => [t.ref, t.title, t.status])).toEqual([["MAIN-1", "Fix the login bug", "todo"]]);
+  });
+
+  test("creation origin stays fixed when another worktree updates and hands off the ticket", () => {
+    sb = sandbox();
+    const issued = sb.json(["new", "Keep the creation origin"], { cwd: sb.feat });
+    expect([issued.created_branch, issued.created_worktree]).toEqual(["feat", sb.feat]);
+    sb.json(["status", "1", "in_progress"], { cwd: sb.main });
+    sb.json(["edit", "1", "--title", "Updated from main"], { cwd: sb.main });
+    sb.json(["handoff", "1", "--summary", "Continue on main", "--body", "-"], {
+      cwd: sb.main,
+      stdin: "## Done\nCreated elsewhere\n\n## In progress\nMain work\n\n## Blocked\nNone\n\n## Next\nContinue\n",
+    });
+
+    const ticket = sb.json(["show", "1", "--latest-handoff"], { cwd: sb.main });
+    expect([ticket.created_branch, ticket.created_worktree]).toEqual(["feat", sb.feat]);
+    expect([ticket.handoffs[0].branch, ticket.handoffs[0].worktree]).toEqual(["main", sb.main]);
+    expect(sb.json(["brief"]).tickets[0].created_worktree).toBe(sb.feat);
+    expect(sb.json(["ls"]).tickets[0]).not.toHaveProperty("created_worktree");
+  });
+
+  test("a detached creation records the worktree without inventing a branch", () => {
+    sb = sandbox();
+    const detached = Bun.spawnSync(["git", "-C", sb.feat, "switch", "--detach", "-q"]);
+    expect(detached.exitCode).toBe(0);
+    const ticket = sb.json(["new", "Detached creation"], { cwd: sb.feat });
+    expect([ticket.created_branch, ticket.created_worktree]).toEqual([null, sb.feat]);
+    expect(sb.json(["show", ticket.ref]).created_branch).toBeNull();
+  });
+
+  test("upgrading a pre-origin database preserves old tickets and leaves their creation origin unknown", () => {
+    sb = sandbox();
+    // A version-5 database is a historical input, not a copy of the current migration implementation.
+    const old = new Database(sb.db, { create: true });
+    old.exec(`
+      CREATE TABLE repos (id INTEGER PRIMARY KEY, root TEXT UNIQUE, slug TEXT UNIQUE, name TEXT, next_number INTEGER, created_at INTEGER);
+      CREATE TABLE tickets (id INTEGER PRIMARY KEY, repo_id INTEGER, number INTEGER, title TEXT, body TEXT, status TEXT,
+        created_by TEXT, provider TEXT, model TEXT, session_id TEXT, created_at INTEGER, updated_at INTEGER,
+        session_terminal TEXT, session_at INTEGER, UNIQUE(repo_id, number));
+      CREATE TABLE events (id INTEGER PRIMARY KEY, ticket_id INTEGER, kind TEXT, from_status TEXT, to_status TEXT, actor TEXT, created_at INTEGER);
+      CREATE TABLE handoffs (id INTEGER PRIMARY KEY, ticket_id INTEGER, summary TEXT, body TEXT, branch TEXT, worktree TEXT,
+        created_by TEXT, provider TEXT, model TEXT, session_id TEXT, created_at INTEGER);
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER);
+      INSERT INTO meta VALUES ('rev', 8);
+      PRAGMA user_version = 5;
+    `);
+    old.query("INSERT INTO repos VALUES (1, ?, 'MAIN', 'main', 8, 100)").run(sb.main);
+    old.exec("INSERT INTO tickets VALUES (42, 1, 7, 'Legacy work', 'Original legacy goal', 'in_review', 'agent', 'openai', 'legacy-model', 'session-old', 100, 200, 't-old', 190)");
+    old.exec("INSERT INTO events VALUES (3, 42, 'status', 'todo', 'in_review', 'human', 200)");
+    old.query("INSERT INTO handoffs VALUES (9, 42, 'Legacy handoff', 'Original checkpoint', 'old-branch', ?, 'human', NULL, NULL, NULL, 180)").run(sb.feat);
+    old.close();
+
+    const ticket = sb.json(["show", "7"], { cwd: sb.feat });
+    expect([ticket.created_branch, ticket.created_worktree]).toEqual([null, null]);
+    expect(ticket.tags).toEqual([]);
+    expect([ticket.title, ticket.body, ticket.status, ticket.model, ticket.session.terminal]).toEqual([
+      "Legacy work", "Original legacy goal", "in_review", "legacy-model", "t-old",
+    ]);
+    expect(ticket.events.map((e: { kind: string; actor: string }) => [e.kind, e.actor])).toEqual([["status", "human"]]);
+    expect(ticket.handoffs.map((h: { summary: string; branch: string | null; worktree: string | null }) => [h.summary, h.branch, h.worktree])).toEqual([["Legacy handoff", "old-branch", sb.feat]]);
+    const next = sb.json(["new", "New after migration"], { cwd: sb.feat });
+    expect([next.number, next.created_branch, next.created_worktree]).toEqual([8, "feat", sb.feat]);
+    expect(next.tags).toEqual([]);
   });
 
   test("outside a git repository it refuses", () => {
