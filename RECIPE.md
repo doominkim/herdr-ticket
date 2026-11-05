@@ -2,6 +2,8 @@
 
 A panel on the right of the window with the tickets of the repository the focused pane is in, in four fixed groups. Each ticket shows its latest handoff and, under it, the agent session that last worked on it, drawn like a row of the Agents sidebar; clicking it goes to that agent.
 
+![herdr-ticket](preview.png)
+
 ## What you see
 
 - A 380px block on the right (`place: right`), surface background, 12px padding.

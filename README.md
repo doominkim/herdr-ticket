@@ -12,6 +12,8 @@
   </p>
 </div>
 
+<p align="center"><img src="preview.png" width="380" alt="The herdr-ticket panel: Todo, In progress, In review and Done groups; an in-progress ticket shows its live Claude Code session, its latest handoff and Go to agent, In review and Delete buttons; a ticket in review shows an ended session"></p>
+
 > **In development.** Expect rough edges and breaking changes before 1.0.
 
 ## One list per repository, from any worktree.
