@@ -1,0 +1,19 @@
+{
+  "name": "herdr-ticket",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "tk": "src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "build": "bun build --compile src/cli.ts --outfile dist/tk"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  },
+  "license": "MIT",
+  "description": "Tickets and session handoffs per repository for Herdr: a CLI for agents and people, and a Herdr app panel."
+}
