@@ -4,7 +4,7 @@
 // (a write from inside a Herdr terminal attaches it), drawn like a row of the Agents sidebar.
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { exec, focused, terminals, hc, run, theme, home } from "herdr";
+import { exec, focused, terminals, hc, run, theme, home, props, openOverlay, closeOverlay } from "herdr";
 
 const TK = () => `${home()}/.local/bin/tk`;
 const POLL_MS = 2000;
@@ -52,7 +52,7 @@ function icon(p, size, color) {
 
 const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
 
-export default class TicketPanel extends View {
+class TicketPanel {
   init(_props, cx) {
     this.cwd = null; // the repository folder the data was loaded for
     this.key = null; // focused folder + terminal it was loaded for
@@ -62,7 +62,6 @@ export default class TicketPanel extends View {
     this.error = null;
     this.open = null; // ref of the expanded ticket
     this.confirmDelete = null; // ref waiting for a second click
-    this.form = null;
     this.msg = null;
     this.loading = false;
     cx.timer.every(POLL_MS, (acx) => this.poll(acx));
@@ -173,32 +172,16 @@ export default class TicketPanel extends View {
     });
   }
 
-  openForm(cx) {
-    const title = InputState.new({ placeholder: "Title" });
-    const body = TextareaState.new({ placeholder: "## Goal / ## Done when (empty: template)", rows: 5 });
-    title.on("submit", () => body.focus());
-    this.form = { title, body };
-    title.focus();
-    cx.notify();
-  }
-
-  closeForm(cx) {
-    this.form?.title.release();
-    this.form?.body.release();
-    this.form = null;
-    cx.notify();
-  }
-
-  submitForm(cx) {
-    const title = this.form.title.value().trim();
-    const body = this.form.body.value();
-    if (!title) {
-      this.msg = "A ticket needs a title";
-      cx.notify();
-      return;
-    }
-    this.closeForm(cx);
-    cx.spawn(async (acx) => this.act(acx, "Issue", ["new", title, ...(body.trim() ? ["--body", body] : [])]));
+  openNewTicket() {
+    if (!this.repo) return;
+    openOverlay({
+      mod: "herdr-ticket",
+      kind: "dialog",
+      modal: true,
+      width: 640,
+      height: 560,
+      props: { role: "new", root: this.repo.root, slug: this.repo.slug },
+    });
   }
 
   // ---- view
@@ -211,12 +194,11 @@ export default class TicketPanel extends View {
       .gap(8)
       .child(div().text_size(14).font_semibold().child(this.repo ? this.repo.slug : "Tickets"))
       .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(this.repo ? this.repo.root.replace(home(), "~") : ""))
-      .when(Boolean(this.repo) && !this.form, (el) => el.child(this.button(t, "tk-new", "+ New ticket", false, (_e, cx) => this.openForm(cx))));
+      .when(Boolean(this.repo), (el) => el.child(this.button(t, "tk-new", "+ New ticket", false, () => this.openNewTicket())));
     root.child(head);
     if (this.msg) root.child(div().text_size(11.5).text_color(t.dim).child(this.msg));
     if (this.error) return root.child(div().text_color(t.dim).child(this.error.includes("not a git repository") ? "Not in a git repository" : this.error));
     if (!this.repo) return root.child(div().text_color(t.dim).child("Loading…"));
-    if (this.form) root.child(this.formView(t));
     const list = v_flex().id("tk-list").flex_1().min_h(0).gap(14).overflow_y_scroll();
     for (const g of GROUPS) {
       const items = this.tickets.filter((x) => x.status === g.status).sort((a, b) => a.number - b.number);
@@ -328,25 +310,12 @@ export default class TicketPanel extends View {
       );
   }
 
-  formView(t) {
-    return v_flex()
-      .gap(6)
-      .p(8)
-      .rounded(6)
-      .border_1()
-      .border_color(t.accent)
-      .child(Input.new(this.form.title).h(30).px(8).rounded(5).border_1().border_color(t.input).bg(t.background))
-      .child(Textarea.new(this.form.body).h(110).px(8).py(4).rounded(5).border_1().border_color(t.input).bg(t.background))
-      .child(
-        h_flex()
-          .gap(6)
-          .justify_end()
-          .child(this.button(t, "tk-form-cancel", "Cancel", false, (_e, cx) => this.closeForm(cx)))
-          .child(this.button(t, "tk-form-save", "Issue", true, (_e, cx) => this.submitForm(cx))),
-      );
-  }
-
   button(t, id, text, primary, action) {
+    return button(t, id, text, primary, action);
+  }
+}
+
+function button(t, id, text, primary, action) {
     return h_flex()
       .id(id)
       .h(26)
@@ -361,5 +330,111 @@ export default class TicketPanel extends View {
       .cursor_pointer()
       .on_click(action)
       .child(text);
+}
+
+const BODY_TEMPLATE = "## Goal\n\n\n## Done when\n- [ ] \n";
+
+/** "+ New ticket": a centered dialog with room for a real description. */
+class NewTicket {
+  init(_props, cx) {
+    const p = props() ?? {};
+    this.root = p.root;
+    this.slug = p.slug;
+    this.msg = null;
+    this.busy = false;
+    this.title = InputState.new({ placeholder: "What needs doing" });
+    this.body = TextareaState.new({ value: BODY_TEMPLATE, rows: 14 });
+    this.title.on("submit", () => this.body.focus());
+    this.title.focus();
+    cx.timer.after(300, () => this.title.focus()); // the dialog takes the keyboard after it opens
+    this.handle = cx.focus_handle();
+  }
+
+  close() {
+    this.title.release();
+    this.body.release();
+    closeOverlay(props()?.overlay);
+  }
+
+  submit(cx) {
+    const title = this.title.value().trim();
+    if (!title) {
+      this.msg = "A ticket needs a title";
+      cx.notify();
+      return;
+    }
+    const body = this.body.value();
+    const isTemplate = body.replace(/\s+/g, " ").trim() === BODY_TEMPLATE.replace(/\s+/g, " ").trim();
+    this.busy = true;
+    this.msg = "Issuing…";
+    cx.notify();
+    cx.spawn(async (acx) => {
+      try {
+        await tk(["new", title, ...(isTemplate ? [] : ["--body", body])], this.root);
+        this.close();
+      } catch (e) {
+        this.busy = false;
+        this.msg = `Issue failed: ${String(e?.message ?? e)}`;
+        acx.notify();
+      }
+    });
+  }
+
+  key(e, cx) {
+    if (e.key === "escape") this.close();
+    else if (e.key === "enter" && e.modifiers.platform) this.submit(cx);
+    else return;
+    cx.stop_propagation();
+  }
+
+  render(_cx) {
+    const t = theme();
+    const label = (text) => div().pt(10).pb(5).text_size(11.5).text_color(t.dim).child(text);
+    return v_flex()
+      .id("tk-new-ticket")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => this.key(e, cx))
+      .size_full()
+      .p(18)
+      .bg(t.popover)
+      .text_color(t.foreground)
+      .text_size(12.5)
+      .child(
+        h_flex()
+          .items_center()
+          .gap(8)
+          .child(div().text_size(15).font_semibold().child("New ticket"))
+          .child(div().px(6).rounded(4).bg(t.raised).text_size(11).text_color(t.dim).child(this.slug ?? ""))
+          .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child((this.root ?? "").replace(home(), "~")))
+          .child(div().text_size(11).text_color(t.dim).child("Esc")),
+      )
+      .child(label("Title"))
+      .child(Input.new(this.title).h(34).px(10).rounded(7).border_1().border_color(t.input).bg(t.background).text_size(13))
+      .child(label("Description"))
+      .child(Textarea.new(this.body).flex_1().min_h(0).px(10).py(8).rounded(7).border_1().border_color(t.input).bg(t.background).text_size(12.5))
+      .child(
+        h_flex()
+          .pt(14)
+          .gap(8)
+          .items_center()
+          .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(this.msg ? t.foreground : t.dim).child(this.msg ?? "⌘Enter to issue"))
+          .child(button(t, "tk-new-cancel", "Cancel", false, () => this.close()))
+          .child(button(t, "tk-new-issue", this.busy ? "Issuing…" : "Issue", true, (_e, cx) => this.submit(cx))),
+      );
+  }
+}
+
+const ROLES = { new: NewTicket };
+
+/** One mod in two roles: the panel (in the layout) and the new-ticket dialog (props.role "new"). */
+export default class HerdrTicket extends View {
+  init(p, cx) {
+    const Role = ROLES[props()?.role] ?? TicketPanel;
+    this.role = new Role();
+    this.role.init(p, cx);
+  }
+
+  render(cx) {
+    return this.role.render(cx);
   }
 }

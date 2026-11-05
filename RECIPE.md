@@ -20,11 +20,11 @@ A panel on the right of the window with the tickets of the repository the focuse
 - Clicking a ticket's title expands or folds it. The status button moves todo → in_progress → in_review → done.
 - **Start agent** runs Claude Code in a new tab of the focused space, in the repository folder, with the first message "Continue ticket APP-3. First read it and its latest handoff with `tk show APP-3`.", links that terminal to the ticket and names the tab after the ticket. When the ticket's session is live the button reads **Go to agent** and focuses it.
 - **Delete** asks inline ("Delete APP-3 with its handoffs? Cancel / Delete") before running `tk delete --yes`.
-- **+ New ticket** opens a title field and a body area; empty body gets the `## Goal` / `## Done when` template.
+- **+ New ticket** opens a centered dialog (640×560, modal): the repository's slug and path, a title field, and a large description prefilled with `## Goal` / `## Done when`. Esc or Cancel closes it, ⌘Enter or Issue issues the ticket (an untouched template is left to `tk`'s own).
 
 ## Built from
 
-- One mod, `mods/herdr-ticket/` (`main.js`, `mod.json`). No layout of its own.
+- One mod, `mods/herdr-ticket/` (`main.js`, `mod.json`), in two roles by `props().role`: the panel (no role, placed in the layout) and the new-ticket dialog (`role: "new"`, opened with `openOverlay({ kind: "dialog", modal: true, width: 640, height: 560 })`). No layout of its own.
 - Data from the `tk` CLI at `~/.local/bin/tk` through `exec`: `rev`, `repo`, `brief`, `ls --status done`, `ls --all-repos --terminal`, `new`, `status`, `delete --yes`, `link`.
 - `herdr` functions: `focused()` (folder, space, terminal), `terminals()` (live state, status, title and program of a session), `hc(["run", …])` with `herdr.space`/`herdr.tab` labels to open the agent in a new tab, `run("tab.rename" | "agent.focus" | "pane.focus")`, `theme()`, `home()`.
 - `gpui-base` `Input` and `Textarea` for the new-ticket form (IME input works).
