@@ -1,26 +1,24 @@
 ---
 name: using-herdr-ticket
-description: "Use for ticket, tikcet, 티켓, 티켓 발급해, 티켓 조회해 requests; ticket creation and lookup; starting/resuming ticket work and reporting completion or review readiness; status changes and handoff; and repository work spanning sessions. herdr-ticket owns these workflows through the repository-scoped tk CLI."
+description: "Use for ticket requests (including the typo tikcet), creation, lookup, work start/resume/review/completion, status and handoff; cross-session repository work; and tk doc specs, ADRs, notes, revisions and ticket links."
 ---
 
 # Using herdr-ticket
 
-`tk` is the source of truth for ticket workflows, work state, requirements, and durable decisions that the **next session or another worktree** must read. A ticket belongs to the repository's original main worktree, so every worktree of a repo sees the same tickets. Run commands from the intended repository/worktree; branch and worktree context belong to that scope. Ordinary single-session discussion stays in chat. Commands and flags: `tk help`.
+`tk` is the source of truth for ticket workflows, work state, requirements, and repository documents that the **next session or another worktree** must read. Tickets and documents belong to the repository's original main worktree and are shared across its worktrees. Run creation/list commands from the intended repository/worktree. Ordinary single-session discussion stays in chat. Commands and flags: `tk help`.
 
-Every write you make carries `--provider <provider> --model <exact model ID you run as> --session <session id, when you have one>`. Inside an agent `tk` refuses a write without provider and model. Inside a Herdr terminal each write also attaches your terminal to the ticket as its session, so the ticket points at you in the Herdr panel.
+Every write you make carries `--provider <provider> --model <exact model ID you run as> --session <session id, when you have one>`. Inside an agent `tk` refuses a write without provider and model. Inside a Herdr terminal (`HC_TERMINAL_ID`), ticket writes attach that terminal to the ticket; document writes capture it in the document's own `session`. A document link does not attach your terminal to its ticket. Author `session_id` and terminal `session` are separate metadata.
 
-## 작성 언어
+## Language
 
-티켓에 새로 작성하거나 수정하는 모든 설명은 항상 한국어로 쓴다. 제목, 목표·완료 기준, 요구사항, 결정의 배경·대안·결과, handoff 요약·본문에 적용하며 저장소의 코드·문서·커밋 언어와 무관하다. `tk new`, `tk edit`, `tk handoff` 실행 전에 제목과 새로 쓴 서술·요약이 한국어인지 확인한다.
-
-CLI와 지침이 사용하는 섹션 제목(`Goal`, `Done when`, `Requirements`, `Decisions`, handoff의 `Done`·`In progress`·`Blocked`·`Next`)은 그대로 유지하고 그 아래 내용을 한국어로 작성한다. 명령어·상태값·태그(`fix`, `feat`, `bug` 등)·티켓 ref·경로·provider/model 식별자·코드와 인용한 오류 원문은 번역하지 않는다. 언어 규칙 적용을 이유로 기존 티켓이나 과거 handoff를 일괄 번역하지 않는다.
+Keep product UI, public documentation, examples and this distributed skill in English. Ticket, document and handoff content follows the user's or repository's language preference; default to English when none is specified. Preserve identifiers, commands, fixed section headings and quoted errors. Do not bulk-translate existing user content without an explicit request.
 
 
 ## Workflow
 
 1. **List or boot**: `tk ls` in text mode for ticket summaries; retain applicable repository/status filters. Read details only for the relevant ticket.
-2. **Resume or look up**: `tk show <ref> --latest-handoff` in text mode gives the ticket body/current state and newest handoff without historical events. The body is the goal; the newest handoff is where the last session stopped. Use `tk show <ref> --pretty` when full structured history is explicitly needed; default text output shows only the newest handoff.
-3. **Create**: check `tk ls` for an existing ticket, then `tk new "한국어 작업 제목" --body -` for multi-session work. An explicit request to create a ticket (including `ticket`, `tikcet`, `티켓`, or `티켓 발급해` in that context), or to note something for later, overrides the multi-session default: issue the ticket and report its ref. A lookup request such as `티켓 조회해` reads existing tickets rather than creating one.
+2. **Resume or look up**: `tk show <ref> --latest-handoff` in text mode gives the body/current state, linked document summaries and newest handoff without historical events. The body is the goal; the newest handoff is where the last session stopped. Read relevant linked documents with `tk doc show <doc-ref>`, adding `--history` only when prior versions matter. Use `tk show <ref> --pretty` when full structured history is explicitly needed.
+3. **Create**: check `tk ls` for an existing ticket, then `tk new "Task title" --body -` for multi-session work. An explicit request to create a ticket or note something for later overrides the multi-session default: issue the ticket and report its ref. Lookup requests read existing tickets rather than creating one.
 4. **Start or resume work**: apply the `in_progress` execution gate below before doing work on the linked ticket, including one just created for that work. Creation-only and lookup-only requests do not start work.
 5. **Before reporting back**: classify the actual outcome using Status Rules, execute the required transition, and confirm its result before the final reply. Chat text and a checked local todo are not ticket-state updates.
 6. **Handoff**: one `tk handoff` when a session that worked on a ticket ends, after resolving its status. Progress and blockers go here, not into a running history in the ticket body.
@@ -29,25 +27,45 @@ Use `--json` only for programmatic consumption; use `--pretty` when readable str
 
 ## Ticket body
 
-Keep the body focused on the goal and acceptance criteria; progress goes to the handoff. When needed, add explicit `## Requirements` and `## Decisions` sections rather than inventing separate CLI entities. Requirements describe who does what; validation criteria include numeric/judgment boundaries and the last accepted/first rejected values. For expensive, cross-feature decisions, get user confirmation in chat before saving the decision and its rationale.
+Keep the body focused on the goal and acceptance criteria; progress goes to the handoff. Feature requirements stay in `## Requirements`: describe who does what, with numeric/judgment boundaries and the last accepted/first rejected values. Save new expensive, cross-feature decisions and rationale in linked ADR documents after user confirmation in chat. Preserve existing ticket `Decisions` sections and history in place; do not bulk-convert them.
 
 ```md
 ## Goal
-이 작업이 끝나면 무엇이 달라지는지 작성한다.
+Describe the observable outcome.
 
 ## Done when
-- [ ] 사용자가 확인할 수 있는 완료 기준
+- [ ] A user-visible acceptance criterion
 ```
 
-Before design or changes to data models, boundaries, protocols, dependencies, or conventions, inspect repository guidance and linked ticket records for relevant decisions. Report when no relevant record is found. Destructive steps (migration, deploy, data deletion, force push) appear in `Done when` with a `user approval gate` line; recording a gate is not approval to execute. `tk edit <ref> --body -` replaces the body whole: read it with `tk show <ref> --latest-handoff`, then send the complete body.
+Before design or changes to data models, boundaries, protocols, dependencies, or conventions, inspect repository guidance, relevant linked documents and existing ticket decision records. Report when no relevant record is found. Destructive steps (migration, deploy, data deletion, force push) appear in `Done when` with a `user approval gate` line; recording a gate is not approval to execute. `tk edit <ref> --body -` replaces the body whole: read it with `tk show <ref> --latest-handoff`, then send the complete body.
+
+## Repository documents
+
+Use `spec` for a durable specification, `adr` for a decision and rationale, or `note` for durable reference prose. Work state and feature `Requirements` stay on the ticket. The Docs panel is outside this CLI feature.
+
+- Find accepted decisions with `tk doc ls --kind adr --status accepted`; `--ticket REF` narrows linked documents. Read full content with `tk doc show REF`, and opt into prior snapshots with `--history`.
+- Create with `tk doc new "Document title" --kind spec|adr|note --body - [--ticket REF]`. Refs are `SLUG-Dn`, or `Dn` in the current repository; document numbers are independent of tickets and never reused.
+- Revise with `tk doc edit REF --title T --body -`. Equals-form text is literal: `--body=-` stores `-`, while separated `--body -` reads stdin and `--body=` clears.
+- ADRs start `proposed`; only proposed advances to `accepted` or `rejected`. Decisions cannot be reversed. `tk doc supersede OLD --by NEW` requires two distinct accepted ADRs in the same repository and only supersedes OLD. Specs/notes have null status and reject these operations.
+- Content/status changes snapshot the previous version, author and time. Creation author/origin stays immutable; `revision_author` describes current content. Link/unlink does not change the content version.
+- `tk doc link/unlink REF --ticket TICKET` manages same-repository many-to-many links. Deleting a ticket removes its associations, not documents. There is no document deletion command.
+- `show`/`brief` return lightweight `docs` summaries (`[]` when unlinked); `ls` remains a ticket-summary list. Read body/history only through `doc show`. All document writes follow the author/language contract above.
+
+The CLI auto-migrates on open, including read commands. Before installing a schema-changing CLI against the real database, obtain explicit approval and a consistent backup. Until then run source CLI only with an isolated `HERDR_TICKET_DB`; calling real-DB `ls` or `show` is not a migration dry-run.
+
 
 ## Tags
 
 When classifying work, read `tk tags` and reuse a fitting name from the current repository's catalog. Add names through `tk new/edit --tags "feat,ui"`; the same successful ticket write registers unknown names and assigns their colors. Untagging or deleting a ticket keeps its definitions reusable. Tag nature and ticket workflow state remain independent.
 
+## Priority
+
+Priority is opt-in: `high`/`medium`/`low` display as High/Medium/Low. Existing and newly unspecified tickets are null (None). Set with `new/edit --priority VALUE`, clear with `--priority=`, and omit the flag to preserve an existing value. Read it from full tickets or summaries. Do not infer priority from tags or agent/workflow state, and do not add sorting or filtering without agreement.
+
+
 ## Child tickets
 
-When a root ticket needs an independently tracked task, issue it with `tk new "한국어 하위 작업 제목" --parent <ref>`. Read its parent first: both must belong to the current repository and only one child level is supported. Use `tk ls --parent <ref>` or the `children` summaries in `tk show` to inspect all child states, including done/canceled.
+When a root ticket needs an independently tracked task, issue it with `tk new "Subtask title" --parent <ref>`. Read its parent first: both must belong to the current repository and only one child level is supported. Use `tk ls --parent <ref>` or the `children` summaries in `tk show` to inspect all child states, including done/canceled.
 
 Treat each child's state, session and handoff independently. Apply Status Rules only to the ticket being worked on; parent/child status never propagates automatically. A parent cannot be deleted while any child remains. Deletion still requires the user's explicit request; a parent deletion request does not authorize deleting its children.
 
@@ -79,20 +97,20 @@ The execution gate is satisfied only when the command succeeds and its output co
 
 ## Handoff
 
-`tk handoff <ref> --summary "<ref> 한국어 한 줄 요약" --body - --provider … --model … --session …`, the body on standard input. Branch and worktree are recorded from where you run it. The summary is at most 200 characters; the body has these four headings in this order (`tk` refuses anything else):
+`tk handoff <ref> --summary "<ref> concise checkpoint" --body - --provider … --model … --session …`, the body on standard input. Branch and worktree are recorded from where you run it. The summary is at most 200 characters; the body has these four headings in this order (`tk` refuses anything else):
 
 ```md
 ## Done
-- 완료하고 검증한 내용
+- Completed and verified work
 
 ## In progress
-- 진행 중인 작업과 현재 상태
+- Work in progress and its current state
 
 ## Blocked
-- 막힌 지점과 원인. 없으면 "없음". 다른 티켓이 막고 있다면 해당 ref를 명시한다.
+- Blockers and their causes, or "None". Name related ticket refs.
 
 ## Next
-- 다음 세션이 바로 이어서 수행할 작업
+- The next concrete action
 ```
 
 ## Common Mistakes

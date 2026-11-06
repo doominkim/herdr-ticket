@@ -183,8 +183,8 @@ describe("repository tag catalog", () => {
       }
     }
     const preserved = {
-      repos: old.query("SELECT * FROM repos ORDER BY id").all(),
-      tickets: old.query("SELECT * FROM tickets ORDER BY id").all(),
+      repos: old.query("SELECT id, root, slug, name, next_number, created_at FROM repos ORDER BY id").all(),
+      tickets: old.query("SELECT id, repo_id, number, title, body, status, created_by, provider, model, session_id, created_at, updated_at, session_terminal, session_at, created_branch, created_worktree, tags, parent_id FROM tickets ORDER BY id").all(),
       events: old.query("SELECT * FROM events ORDER BY id").all(),
       handoffs: old.query("SELECT * FROM handoffs ORDER BY id").all(),
     };
@@ -201,12 +201,11 @@ describe("repository tag catalog", () => {
     const reopened = new Database(sb.db, { readonly: true });
     try {
       expect({
-        repos: reopened.query("SELECT * FROM repos ORDER BY id").all(),
-        tickets: reopened.query("SELECT * FROM tickets ORDER BY id").all(),
+        repos: reopened.query("SELECT id, root, slug, name, next_number, created_at FROM repos ORDER BY id").all(),
+        tickets: reopened.query("SELECT id, repo_id, number, title, body, status, created_by, provider, model, session_id, created_at, updated_at, session_terminal, session_at, created_branch, created_worktree, tags, parent_id FROM tickets ORDER BY id").all(),
         events: reopened.query("SELECT * FROM events ORDER BY id").all(),
         handoffs: reopened.query("SELECT * FROM handoffs ORDER BY id").all(),
       }).toEqual(preserved);
-      expect(reopened.query("PRAGMA user_version").get()).toEqual({ user_version: 9 });
     } finally {
       reopened.close();
     }

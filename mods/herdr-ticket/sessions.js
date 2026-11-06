@@ -1,6 +1,6 @@
 import { div, image, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, shared, run } from "herdr";
+import { Button, v_flex, h_flex } from "gpui-base";
+import { agents, terminals, panes, spaces, focused, shared, run, appHome, readTextFile, setShared, notify } from "herdr";
 import { sessionEntry } from "./session-data.js";
 
 const RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
@@ -33,6 +33,8 @@ export class LinkedSessions {
     this.changed = new Map();
     this.hovered = null;
     this.entries = new Map();
+    this.prompting = new Set();
+    this.disposed = false;
   }
 
   read() {
@@ -106,21 +108,57 @@ export class LinkedSessions {
       .when(!open, el => el.child(String(subs.length)));
   }
 
+  promptsButton(t, address, key) {
+    return Button.new(`${key}-prompts`).tab_index(0).size(22).flex_none().rounded(4)
+      .items_center().justify_center().text_color(t.dim).disabled(this.prompting.has(address))
+      .tooltip("Prompts").accessibility_label(`Prompts for ${address}`)
+      .hover(el => el.bg(t.hover).text_color(t.foreground)).focus(el => el.bg(t.hover)).cursor_pointer()
+      .on_click((_e, cx) => { cx.stop_propagation(); this.openPrompts(address, cx); })
+      .child(svg("mods/workspace-chrome/file-text.svg").size(13));
+  }
+
+  openPrompts(address, cx) {
+    if (this.disposed || this.prompting.has(address)) return;
+    this.prompting.add(address);
+    cx.notify();
+    cx.spawn(async acx => {
+      try {
+        const installed = await readTextFile(`${appHome()}/mods/prompt-jump/mod.json`);
+        if (this.disposed) return;
+        if (installed === null) {
+          notify({ title: "Prompts unavailable", body: "Install Prompt Jump to open this session's prompts.", level: "warning" });
+        } else if (!terminals().some(terminal => terminal.address === address && terminal.state === "live")) {
+          notify({ title: "Prompts unavailable", body: "This session has ended.", level: "warning" });
+        } else {
+          // The receiver owns agent support, panel visibility and pinning; never change pane focus.
+          setShared("prompt-jump.open", { terminal: address, n: `${Date.now()}-${Math.random()}` });
+        }
+      } catch (error) {
+        if (!this.disposed) notify({ title: "Prompts unavailable", body: String(error?.message ?? error), level: "warning" });
+      } finally {
+        this.prompting.delete(address);
+        if (!this.disposed) acx.notify();
+      }
+    });
+  }
+
   row(t, ticket) {
     if (!ticket.session) return null;
     const entry = this.entry(ticket);
+    const key = `tk-session-${ticket.ref}`;
     if (!entry) {
       const live = this.snapshot?.terminals.some(term => term.address === ticket.session.terminal && term.state === "live");
-      return div().px(10).pb(10).text_size(11).text_color(t.muted ?? t.foreground)
-        .tooltip(ticket.session.terminal).child(live ? "Session not listed in Agents" : "Session ended")
-        .when(live, el => el.cursor_pointer().hover(node => node.bg(t.hover))
+      return h_flex().px(10).pb(10).gap(6).items_center().text_size(11).text_color(t.muted ?? t.foreground)
+        .tooltip(ticket.session.terminal)
+        .child(div().flex_1().child(live ? "Session not listed in Agents" : "Session ended"))
+        .when(live, el => el.child(this.promptsButton(t, ticket.session.terminal, key)).cursor_pointer().hover(node => node.bg(t.hover))
           .on_click((_e, cx) => {
             cx.stop_propagation();
             run("pane.focus", { terminal: ticket.session.terminal });
           }));
     }
     const { agent: a, name, detail: more, full, branch } = entry;
-    const key = `tk-session-${ticket.ref}`;
+    const promptAction = this.promptsButton(t, a.address, key);
     const pic = icon(a.program, 16, t.foreground);
     const subs = this.tree(a.address);
     const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
@@ -155,6 +193,7 @@ export class LinkedSessions {
         .when(full && Boolean(more), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`· ${more}`))))
       .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
       .when(subs.length > 0, el => el.child(this.fold(t, a, subs, key)))
+      .when(this.hovered === key, el => el.child(promptAction))
       .when(this.hovered === key, el => el.child(pin))
       .when(this.hovered !== key && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(this.now - when))))
       .child(glyph(t, a.status, this.sort === "priority" && !isPinned));
@@ -165,6 +204,8 @@ export class LinkedSessions {
   }
 
   dispose() {
+    this.disposed = true;
+    this.prompting.clear();
     this.snapshot = null;
     this.entries.clear();
     this.changed.clear();

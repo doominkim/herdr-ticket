@@ -166,6 +166,7 @@ describe("ls", () => {
       title: "Completed work",
       status: "done",
       tags: [],
+      priority: null,
       session: { terminal: "t-finished", at: expect.any(Number) },
       created_at: expect.any(Number),
       updated_at: expect.any(Number),

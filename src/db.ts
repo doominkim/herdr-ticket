@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, linkSync, mkdirSync, rmSync } from "node:fs";
+import { linkSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { TAG_COLORS } from "../mods/herdr-ticket/tag-colors.js";
@@ -96,6 +96,50 @@ const MIGRATIONS = [
    ${["INSERT", "UPDATE", "DELETE"].map(op =>
      `CREATE TRIGGER rev_repo_tags_${op.toLowerCase()} AFTER ${op} ON repo_tags
       BEGIN UPDATE meta SET value = value + 1 WHERE key = 'rev'; END;`).join("\n")}`,
+  `ALTER TABLE repos ADD COLUMN next_doc_number INTEGER NOT NULL DEFAULT 1;
+   CREATE TABLE docs (
+     id INTEGER PRIMARY KEY,
+     repo_id INTEGER NOT NULL REFERENCES repos(id),
+     number INTEGER NOT NULL,
+     kind TEXT NOT NULL CHECK (kind IN ('spec', 'adr', 'note')),
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     status TEXT,
+     version INTEGER NOT NULL DEFAULT 1,
+     superseded_by_id INTEGER REFERENCES docs(id),
+     created_by TEXT NOT NULL,
+     provider TEXT, model TEXT, session_id TEXT,
+     created_branch TEXT, created_worktree TEXT,
+     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+     revision_author TEXT NOT NULL,
+     session_terminal TEXT, session_at INTEGER,
+     UNIQUE (repo_id, number),
+     CHECK ((kind = 'adr' AND status IS NOT NULL AND status IN ('proposed', 'accepted', 'rejected', 'superseded'))
+       OR (kind IN ('spec', 'note') AND status IS NULL)),
+     CHECK ((status = 'superseded' AND superseded_by_id IS NOT NULL)
+       OR (status IS NOT 'superseded' AND superseded_by_id IS NULL)),
+     CHECK (superseded_by_id IS NULL OR superseded_by_id != id)
+   );
+   CREATE TABLE doc_revisions (
+     doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+     version INTEGER NOT NULL,
+     title TEXT NOT NULL, body TEXT NOT NULL, status TEXT,
+     superseded_by_id INTEGER REFERENCES docs(id),
+     author TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY (doc_id, version)
+   );
+   CREATE TABLE doc_links (
+     doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+     ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+     PRIMARY KEY (doc_id, ticket_id)
+   );
+   CREATE INDEX doc_links_ticket ON doc_links (ticket_id, doc_id);
+   ${["docs", "doc_revisions", "doc_links"].flatMap(table => ["INSERT", "UPDATE", "DELETE"].map(op =>
+     `CREATE TRIGGER rev_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
+      BEGIN UPDATE meta SET value = value + 1 WHERE key = 'rev'; END;`)).join("\n")}`,
+  // Priorities are opt-in; existing and newly unspecified tickets remain unclassified.
+  `ALTER TABLE tickets ADD COLUMN priority TEXT CHECK (priority IS NULL OR priority IN ('high', 'medium', 'low'));`,
 ];
 
 export function rev(db: Database): number {
@@ -115,23 +159,52 @@ function migrate(db: Database): void {
 }
 
 /**
- * Creates the file whole, out of sight, then links it into place. Switching a fresh file to WAL
- * while other processes open it can fail "locked" without waiting, so nobody sees a half-made file;
- * a process that loses the race to link drops its copy and uses the winner's.
+ * Keep new files private until migration finishes. On macOS, unlinking a temporary hard link
+ * after another process opens the published file invalidates that connection (IOERR_VNODE).
+ * Readers may bypass the bootstrap lock only once the published inode has a single name.
  */
 function createIfMissing(path: string): void {
-  if (existsSync(path)) return;
-  const tmp = `${path}.new-${process.pid}-${Date.now()}`;
-  const db = new Database(tmp, { create: true, strict: true });
-  db.run("PRAGMA journal_mode = WAL"); // stored in the file: later opens are already WAL
-  migrate(db);
-  db.close();
+  if (statSync(path, { throwIfNoEntry: false })?.nlink === 1) return;
+  // Never delete this lock DB: every initializer must lock the same inode. SQLite releases
+  // its write lock when a process crashes, unlike a mkdir/PID sentinel that can stay locked.
+  const bootstrap = new Database(`${path}.init`, { create: true, strict: true });
   try {
-    linkSync(tmp, path);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    bootstrap.run("PRAGMA busy_timeout = 5000");
+    bootstrap.transaction(() => {
+      // The bootstrap lock owns this fixed temporary name, including leftovers after a crash.
+      const tmp = `${path}.init-tmp`;
+      const discard = () => {
+        for (const file of [tmp, `${tmp}-wal`, `${tmp}-shm`]) rmSync(file, { force: true });
+      };
+      const published = statSync(path, { throwIfNoEntry: false });
+      if (published) {
+        const pending = statSync(tmp, { throwIfNoEntry: false });
+        // A creator can die between link and unlink. No reader opens that two-name inode
+        // before acquiring this lock, so its matching orphan alias is safe to remove here.
+        if (pending?.dev === published.dev && pending.ino === published.ino) discard();
+      } else {
+        discard();
+        try {
+          const db = new Database(tmp, { create: true, strict: true });
+          try {
+            db.run("PRAGMA journal_mode = WAL");
+            migrate(db);
+          } finally {
+            db.close(true);
+          }
+          try {
+            linkSync(tmp, path); // atomic publication, never overwrite an existing database
+          } catch (e) {
+            if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+          }
+        } finally {
+          discard();
+        }
+      }
+      if (statSync(path).nlink !== 1) throw new Error(`Database has an unexpected hard link: ${path}`);
+    }).immediate();
   } finally {
-    for (const f of [tmp, `${tmp}-wal`, `${tmp}-shm`]) rmSync(f, { force: true });
+    bootstrap.close(true);
   }
 }
 

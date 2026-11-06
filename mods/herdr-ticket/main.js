@@ -2,19 +2,31 @@
 // read through the `tk` CLI. Agents write through the same CLI, so the panel polls `tk rev` and
 // reloads only when something changed. Each ticket shows the Herdr session that last worked on it
 // (a write from inside a Herdr terminal attaches it), drawn like a row of the Agents sidebar.
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Button, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
-import { focused, theme, home, settings, props, openOverlay, closeOverlay } from "herdr";
+import { focused, theme, home, settings, props, openOverlay, closeOverlay, shared } from "herdr";
 import { GROUPS, selectTickets } from "./list.js";
 import { tk } from "./commands.js";
 import { AgentPicker } from "./agent.js";
-import { createdAge, ticketMarkdown } from "./presentation.js";
+import { createdAge, isDarkBackground, ticketMarkdown } from "./presentation.js";
 import { LinkedSessions } from "./sessions.js";
 import { TagSelection } from "./tag-picker.js";
 import { tagPill } from "./tag-style.js";
+import { SessionLabelRuntime, SESSION_LABEL_ERROR } from "./session-label-runtime.js";
+import { PriorityEditor, priorityChoices, priorityColor, priorityMark } from "./priority.js";
 
-const POLL_MS = 2000;
+const POLL_MS = 1000; // Leave CLI reload time inside the 2-second refresh target.
 const NEXT = { todo: "in_progress", in_progress: "in_review", in_review: "done" };
+let composerKeysBound = false;
+function bindComposerKeys(cx) {
+  if (composerKeysBound) return;
+  // Textareas consume Input actions before an ancestor-only binding can run.
+  cx.bind_keys([
+    { keystroke: "cmd-enter", action: "herdr-ticket-submit", context: "HerdrTicketCompose" },
+    { keystroke: "cmd-enter", action: "herdr-ticket-submit", context: "HerdrTicketCompose > Input" },
+  ]);
+  composerKeysBound = true;
+}
 
 
 
@@ -40,12 +52,10 @@ class TicketPanel {
     this.sessions.init(cx);
     this.open = this.pinnedRef; // ref of the expanded ticket
     this.more = null;
-    this.bodyOpen = false;
-    this.handoffOpen = false;
     this.filter = "open";
     this.query = "";
     this.search = InputState.new({ placeholder: "Search title or ticket ID…" });
-    this.search.on("change", (_e, acx) => { this.query = this.search.value(); acx.notify(); });
+    this.search.on("change", () => { if (!this.disposed) { this.query = this.search.value(); cx.notify(); } });
     this.msg = null;
     this.loading = false;
     cx.timer.every(POLL_MS, (acx) => this.poll(acx));
@@ -73,8 +83,6 @@ class TicketPanel {
         if (this.cwd !== root) {
           this.open = this.pinnedRef;
           this.more = null;
-          this.bodyOpen = false;
-          this.handoffOpen = false;
           this.filter = "open";
           this.query = "";
           this.search.set_value("");
@@ -108,8 +116,6 @@ class TicketPanel {
           if (this.open === expandedRef) {
             this.open = null;
             this.more = null;
-            this.bodyOpen = false;
-            this.handoffOpen = false;
           }
         }
         this.tickets = this.pinnedRef ? (expanded ? [expanded] : []) : tickets.map(x => x.ref === expanded?.ref ? expanded : x);
@@ -169,7 +175,7 @@ class TicketPanel {
   openAgent(x) {
     if (!this.cwd) return;
     openOverlay({
-      mod: "herdr-ticket", kind: "dialog", modal: true, width: 600, height: 620,
+      mod: "herdr-ticket", kind: "dialog", modal: true, width: 600, height: 750,
       props: { role: "agent", root: this.cwd, ref: x.ref, title: x.title, session: x.session },
     });
   }
@@ -235,6 +241,24 @@ class TicketPanel {
     });
   }
 
+  openPriority(x) {
+    if (!this.repo) return;
+    this.more = null;
+    openOverlay({
+      mod: "herdr-ticket", kind: "dialog", modal: true, width: 440, height: 300,
+      props: { role: "priority", root: this.repo.root, ref: x.ref },
+    });
+  }
+
+  openEdit(x) {
+    if (!this.repo) return;
+    this.more = null;
+    openOverlay({
+      mod: "herdr-ticket", kind: "dialog", modal: true, width: 640, height: 600,
+      props: { role: "edit", root: this.repo.root, ref: x.ref },
+    });
+  }
+
   dispose() {
     this.disposed = true;
     this.sessions.dispose();
@@ -245,45 +269,53 @@ class TicketPanel {
   // ---- view
 
   render(_cx) {
-    const t = theme(), secondary = t.muted ?? t.foreground;
+    const t = theme(), secondary = t.dim ?? t.muted ?? t.foreground;
+    this.dark = isDarkBackground(t.background);
     this.sessions.read();
-    const root = v_flex().id("herdr-ticket").size_full().min_w(0).min_h(0).gap(12).p(12)
-      .bg(t.surface ?? t.background).text_color(t.foreground).text_size(12.5).line_height(1.5);
+    const root = v_flex().id("herdr-ticket").size_full().min_w(0).min_h(0).gap(8).p(8)
+      .bg(t.chrome).text_color(t.foreground).text_size(13).line_height(1.5);
     if (this.handle) root.track_focus(this.handle).on_key_down((e, cx) => {
       if (e.key === "escape") { closeOverlay(props()?.overlay); cx.stop_propagation(); }
     });
-    root.child(v_flex().gap(5)
-      .child(h_flex().items_center().gap(8)
-        .child(div().flex_1().min_w(0).text_size(15).font_semibold().child(this.repo?.slug ?? "Tickets"))
-        .when(Boolean(this.repo), el => el.child(button(t, "tk-new", "+ New ticket", false, () => this.openNewTicket()))))
-      .when(Boolean(this.repo), el => el.child(div().text_size(10).font_family(settings().font_family ?? "Menlo")
+    root.child(v_flex().gap(4)
+      .child(h_flex().h(31).pl(8).pr(2).items_center().gap(6).text_color(secondary)
+        .child(div().flex_1().min_w(0).text_size(11.5).font_medium().child("Tickets"))
+        .when(Boolean(this.repo), el => el.child(iconButton(t, "tk-new", "mods/herdr-ticket/ticket.svg",
+          "New ticket", () => this.openNewTicket())))
+        .when(Boolean(this.pinnedRef), el => el.child(iconButton(t, "tk-detail-close", "mods/workspace-chrome/x.svg",
+          "Close ticket", () => closeOverlay(props()?.overlay)))))
+      .when(Boolean(this.repo), el => el.child(div().px(8).text_size(10.5)
         .text_color(secondary).truncate().tooltip(this.repo.root).child(this.repo.root.replace(home(), "~")))));
-    if (this.pinnedRef) root.child(button(t, "tk-detail-close", "Close", false, () => closeOverlay(props()?.overlay)));
     if (this.msg) root.child(div().role("status").text_size(11.5).text_color(secondary).child(this.msg));
     if (this.error) return root.child(div().role("alert").text_color(secondary)
       .child(this.error.includes("not a git repository") ? "Not in a git repository" : this.error));
     if (!this.repo) return root.child(div().text_color(secondary).child("Loading…"));
     if (this.catalogError) root.child(div().role("alert").text_size(11).text_color(secondary).child(this.catalogError));
+    const labelError = shared(SESSION_LABEL_ERROR);
+    if (typeof labelError === "string" && labelError) root.child(div().role("alert").text_size(11)
+      .text_color(secondary).whitespace_normal().child(`Session label sync failed: ${labelError}`));
     const selection = selectTickets(this.tickets, this.filter, this.query);
     const counts = selection.counts;
     const groups = this.pinnedRef ? this.tickets.map(x => ({
       status: x.status, name: GROUPS.find(g => g.status === x.status)?.name ?? "Canceled",
       symbol: GROUPS.find(g => g.status === x.status)?.symbol ?? "×", items: [x],
+      families: [{ ref: x.ref, parent: x, items: [x] }],
     })) : selection.groups;
+    this.visibleRefs = new Set(groups.flatMap(g => g.items.map(x => x.ref)));
     if (!this.pinnedRef) {
-      root.child(Input.new(this.search).h(34).px(10).rounded(6).border_1().border_color(t.border)
-        .bg(t.raised).text_size(12).accessibility_label("Search tickets by title or ID"));
+      root.child(Input.new(this.search).h(32).px(10).rounded(6).border_1().border_color(t.border)
+        .bg(t.raised).text_size(13).accessibility_label("Search tickets by title or ID"));
       root.child(h_flex().gap(4).border_b(1).border_color(t.border).children([
-      ["open", "Open"], ["in_review", "In review"], ["done", "Done"],
+      ["open", "Open"], ["in_progress", "In Progress"], ["in_review", "In review"], ["done", "Done"],
     ].map(([value, label]) => Button.new(`tk-filter-${value}`).tab_index(0).selected(this.filter === value)
-      .px(8).py(8).text_size(11).font_semibold().border_b(2)
+      .px(6).py(7).text_size(11.5).font_medium().border_b(2)
       .border_color(this.filter === value ? t.accent : t.border)
-      .text_color(this.filter === value ? t.accent : secondary)
+      .text_color(this.filter === value ? t.foreground : secondary)
       .focus(el => el.bg(t.hover)).hover(el => el.bg(t.hover)).cursor_pointer()
       .on_click((_e, cx) => { this.filter = value; this.more = null; cx.notify(); })
       .child(`${label}  ${counts[value]}`))));
     }
-    const list = v_flex().id("tk-list").flex_1().min_h(0).min_w(0).gap(14).overflow_y_scroll();
+    const list = v_flex().id("tk-list").flex_1().min_h(0).min_w(0).gap(14).overflow_y_scrollbar();
     for (const g of groups) {
       const color = g.status === "in_progress" ? t.accent : g.status === "in_review" ? t.blocked ?? secondary : secondary;
       list.child(v_flex().gap(7)
@@ -291,38 +323,61 @@ class TicketPanel {
           .child(div().text_color(color).child(g.symbol))
           .child(div().flex_1().font_semibold().child(g.name))
           .child(div().font_family(settings().font_family ?? "Menlo").text_size(10).child(String(g.items.length))))
-        .children(g.items.map(x => this.ticketView(t, x))));
+        .children(g.families.map(family => this.familyView(t, family, g.status))));
     }
     if (!groups.length) {
-      const searching = Boolean(this.query.trim()), empty = counts.open + counts.in_review + counts.done === 0;
+      const searching = Boolean(this.query.trim()), empty = counts.open + counts.in_progress + counts.in_review + counts.done === 0;
       list.child(v_flex().py(24).gap(10)
         .child(div().font_semibold().child(searching ? "No matching tickets" : empty ? "No tickets in this repository" : "No tickets here"))
         .child(div().text_size(12).text_color(secondary).child(searching ? "Try another title or ticket ID." : empty ? "Create a ticket to capture the next task." : "Choose another filter to see more tickets."))
         .when(searching, el => el.child(button(t, "tk-clear", "Clear search", false, (_e, cx) => {
           this.search.set_value(""); this.query = ""; this.search.focus(); cx.notify();
         })))
-        .when(empty && !searching, el => el.child(button(t, "tk-empty-new", "+ New ticket", false, () => this.openNewTicket()))));
+        .when(empty && !searching, el => el.child(iconButton(t, "tk-empty-new", "mods/herdr-ticket/ticket.svg", "New ticket", () => this.openNewTicket()))));
     }
     return root.child(list).child(div().border_t(1).border_color(t.border).pt(8)
       .text_size(10).text_color(secondary).child("Shared across worktrees"));
   }
 
 
-  ticketView(t, x) {
-    const isOpen = this.open === x.ref, secondary = t.muted ?? t.foreground;
+  familyView(t, family, status) {
+    const parent = family.items.find(x => x.ref === family.ref);
+    const children = family.items.filter(x => x.ref !== family.ref);
+    if (!children.length) return this.ticketView(t, parent);
+    const secondary = t.muted ?? t.foreground;
+    const group = v_flex().min_w(0).gap(8);
+    if (parent) group.child(this.ticketView(t, parent));
+    const nested = v_flex().min_w(0).ml(9).pl(9).border_l(2).border_color(t.border).gap(4);
+    if (parent) nested.child(div().px(8).py(4).text_size(10.5).text_color(secondary)
+      .child(`Subtasks · ${children.length}`));
+    else nested.child(Button.new(`tk-family-${status}-${family.ref}`).tab_index(0).w_full().min_w(0).px(8).py(5)
+      .text_size(11).text_color(secondary).cursor_pointer().hover(el => el.bg(t.hover)).focus(el => el.bg(t.hover))
+      .accessibility_label(`Open parent ${family.ref}`).tooltip(family.parent?.title ?? family.ref)
+      .on_click(() => this.openTicket(family.ref))
+      .child(div().min_w(0).whitespace_normal().max_h(36).overflow_hidden()
+        .child(`↳ ${family.ref}${family.parent ? ` · ${family.parent.title}` : ""}`)));
+    nested.children(children.map((child, i) => v_flex().min_w(0)
+      .when(i > 0, el => el.border_t(1).border_color(t.border))
+      .child(this.ticketView(t, child, true))));
+    return group.child(nested);
+  }
+
+  ticketView(t, x, nested = false) {
+    const isOpen = this.open === x.ref, secondary = t.dim ?? t.muted ?? t.foreground;
     const h = x.latest_handoff ?? x.handoffs?.[0] ?? null;
     const liveStatus = this.sessions.status(t, x);
-    const card = v_flex().id(`tk-${x.ref}`).min_w(0).rounded(6).border_1()
-      .bg(t.surface ?? t.background).border_color(isOpen ? t.accent : t.border)
-      .child(Button.new(`tk-head-${x.ref}`).tab_index(0).w_full().min_w(0).p(10)
+    const card = v_flex().id(`tk-${x.ref}`).relative().min_w(0).bg(t.surface ?? t.background)
+      .when(!nested, el => el.rounded(6).border_1().border_color(isOpen ? t.accent : t.border))
+      .when(nested && isOpen, el => el.border_l(2).border_color(t.accent))
+      .when(Boolean(x.priority), el => el.child(div().absolute().left(2).top(7).bottom(7).w(3).rounded(2)
+        .bg(priorityColor(x.priority, this.dark))))
+      .child(Button.new(`tk-head-${x.ref}`).tab_index(0).w_full().min_w(0).p(nested ? 8 : 10)
         .selected(isOpen).cursor_pointer().rounded(5).hover(el => el.bg(t.hover)).focus(el => el.bg(t.hover))
         .accessibility_label(`${x.ref}: ${x.title}. ${isOpen ? "Collapse" : "Expand"} ticket`).tooltip(x.title)
         .on_click((_e, cx) => {
           if (this.pinnedRef) return;
           this.open = isOpen ? null : x.ref;
           this.more = null;
-          this.bodyOpen = false;
-          this.handoffOpen = false;
           cx.notify();
           if (!isOpen) this.reload(cx);
         })
@@ -331,64 +386,21 @@ class TicketPanel {
             .child(h_flex().flex_1().min_w(0).gap(4).items_center().flex_wrap()
               .child(h_flex().gap(5).items_center().flex_none()
                 .when(Boolean(liveStatus), el => el.child(liveStatus))
-                .child(div().text_size(14.5).font_bold().text_color(t.foreground)
-                  .font_family(settings().font_family ?? "Menlo").child(x.ref)))
+                .child(div().text_size(nested ? 13 : 14.5).font_bold().text_color(t.foreground).child(x.ref)))
+              .when(Boolean(x.priority), el => el.child(priorityMark(t, x.priority, this.dark)))
               .children((x.tags ?? []).map(tag => tagPill(t, tag, this.catalog.find(entry => entry.name === tag)?.color))))
-            .child(div().flex_none().text_size(10).tooltip(new Date(x.created_at).toLocaleString()).child(createdAge(x.created_at))))
-          .child(div().w_full().min_w(0).text_size(15).font_bold().line_height(1.5).whitespace_normal()
-            .when(!isOpen, el => el.max_h(45).overflow_hidden()).child(x.title))))
+            .child(div().flex_none().text_size(10.5).tooltip(new Date(x.created_at).toLocaleString()).child(createdAge(x.created_at))))
+          .child(div().w_full().min_w(0).text_size(nested ? 12.5 : 13).font_semibold().line_height(1.5).whitespace_normal()
+            .when(!isOpen, el => el.max_h(nested ? 37.5 : 39).overflow_hidden()).child(x.title))))
       .when(Boolean(x.session), el => el.child(this.sessions.row(t, x)));
     if (!isOpen) return card;
     if (x.body === undefined) return card.child(div().px(10).pb(10).text_size(12).text_color(secondary).child("Loading…"));
     const detail = v_flex().px(10).pb(10).gap(10).min_w(0);
-    if (h) detail.child(v_flex().p(10).gap(5).rounded(5).bg(t.raised)
-      .child(div().text_size(10).font_semibold().text_color(secondary).child("LATEST HANDOFF"))
-      .child(div().text_size(12).line_height(1.6).whitespace_normal().child(h.summary)));
-    if (x.parent_ref) detail.child(button(t, `tk-parent-${x.ref}`, `↑ Parent · ${x.parent_ref}`, false, () => this.openTicket(x.parent_ref)));
-    if (!x.parent_ref) {
-      detail.child(h_flex().items_center().gap(6)
-        .child(div().flex_1().text_size(11).font_semibold().text_color(secondary).child("SUBTASKS"))
-        .child(button(t, `tk-child-new-${x.ref}`, "+ Add subtask", false, () => this.openNewTicket(x))));
-      for (const child of x.children ?? []) detail.child(
-        Button.new(`tk-child-${child.ref}`).tab_index(0).w_full().min_w(0).p(7).rounded(4)
-          .hover(el => el.bg(t.hover)).focus(el => el.bg(t.hover)).cursor_pointer()
-          .on_click(() => this.openTicket(child.ref))
-          .child(v_flex().gap(3).min_w(0)
-            .child(h_flex().gap(6).child(div().font_semibold().child(child.ref))
-              .child(div().text_color(secondary).child(child.status.replace(/_/g, " "))))
-            .child(div().whitespace_normal().child(child.title))));
-    }
-    detail.child(Button.new(`tk-body-toggle-${x.ref}`).tab_index(0).py(4).w_full()
-      .text_size(11).text_color(secondary).cursor_pointer().focus(el => el.bg(t.hover))
-      .selected(this.bodyOpen).accessibility_label(`${this.bodyOpen ? "Collapse" : "Expand"} goal and done when`)
-      .on_click((_e, cx) => { this.bodyOpen = !this.bodyOpen; cx.notify(); })
-      .child(`${this.bodyOpen ? "▾" : "▸"} Goal & done when`));
-    if (this.bodyOpen) {
-      detail.child(TextView.markdown(`tk-body-${x.ref}`, x.body.trim() || "(no body)")
-        .w_full().min_w(0).text_size(12).line_height(1.6).selectable(true));
-      detail.child(v_flex().gap(3).min_w(0).text_size(10).text_color(secondary)
-        .child(div().font_semibold().child("CREATED IN"))
-        .child(div().truncate().tooltip(x.created_branch ?? "")
-          .child(x.created_branch ?? (x.created_worktree ? "(detached HEAD)" : "Unknown")))
-        .when(Boolean(x.created_worktree), el => el.child(div().truncate()
-          .tooltip(x.created_worktree).child(x.created_worktree))));
-    }
-    if (h) {
-      detail.child(Button.new(`tk-handoff-toggle-${x.ref}`).tab_index(0).py(4).w_full()
-        .text_size(11).text_color(secondary).cursor_pointer().focus(el => el.bg(t.hover))
-        .selected(this.handoffOpen).accessibility_label(`${this.handoffOpen ? "Collapse" : "Expand"} handoff details and session`)
-        .on_click((_e, cx) => { this.handoffOpen = !this.handoffOpen; cx.notify(); })
-        .child(`${this.handoffOpen ? "▾" : "▸"} Handoff details & session`));
-      if (this.handoffOpen) detail.child(v_flex().gap(8).min_w(0)
-        .child(TextView.markdown(`tk-handoff-${x.ref}`, h.body).w_full().min_w(0).text_size(12).line_height(1.6).selectable(true))
-        .child(div().text_size(10).text_color(secondary).truncate().tooltip(h.branch ?? "").child(h.branch || "(no branch)"))
-        .child(div().text_size(10).text_color(secondary).truncate()
-          .tooltip(h.provider ? `${h.provider}/${h.model}` : "human").child(h.provider ? `${h.provider}/${h.model}` : "human")));
-    }
     const next = NEXT[x.status];
     detail.child(h_flex().gap(6).items_center()
-      .child(button(t, `tk-agent-${x.ref}`, "Go / Start agent…", true, () => this.openAgent(x)))
-      .when(Boolean(next), el => el.child(button(t, `tk-next-${x.ref}`, `→ ${GROUPS.find(g => g.status === next).name}`, false,
+      .child(iconButton(t, `tk-agent-${x.ref}`, "mods/workspace-chrome/terminal.svg", "Go / Start agent…", () => this.openAgent(x)))
+      .when(Boolean(next), el => el.child(iconButton(t, `tk-next-${x.ref}`, `mods/workspace-chrome/${next === "done" ? "check" : "chevron-right"}.svg`,
+        `Move to ${GROUPS.find(g => g.status === next).name}`,
         (_e, cx) => cx.spawn(async acx => this.act(acx, "Move", ["status", x.ref, next])))))
       .child(div().flex_1())
       .child(button(t, `tk-more-${x.ref}`, "•••", false, (_e, cx) => {
@@ -397,12 +409,55 @@ class TicketPanel {
     if (this.more === x.ref) detail.child(v_flex().p(8).gap(6).rounded(5).border_1().border_color(t.border)
       .child(button(t, `tk-copy-context-${x.ref}`, "Copy full context (Markdown)", false, (_e, cx) => this.copy(cx, x, true)))
       .child(button(t, `tk-copy-id-${x.ref}`, "Copy ID", false, (_e, cx) => this.copy(cx, x, false)))
+      .child(button(t, `tk-edit-${x.ref}`, "Edit ticket…", false, (_e, cx) => { this.openEdit(x); cx.notify(); }))
       .child(button(t, `tk-tags-${x.ref}`, "Edit tags…", false, (_e, cx) => { this.openTags(x); cx.notify(); }))
+      .child(button(t, `tk-priority-${x.ref}`, "Priority…", false, (_e, cx) => { this.openPriority(x); cx.notify(); }))
       .child(button(t, `tk-delete-${x.ref}`, "Delete ticket…", false, (_e, cx) => { this.openDelete(x); cx.notify(); })
         .text_color(t.blocked ?? t.foreground)));
+    detail.child(TextView.markdown(`tk-body-${x.ref}`, x.body.trim() || "(no body)")
+      .w_full().min_w(0).text_size(12).line_height(1.6).selectable(true));
+    if (h) detail.child(v_flex().border_t(1).border_color(t.border).pt(10).gap(8).min_w(0)
+      .child(div().text_size(11).font_semibold().text_color(secondary).child("Latest handoff"))
+      .child(div().text_size(12).line_height(1.6).whitespace_normal().child(h.summary))
+      .child(TextView.markdown(`tk-handoff-${x.ref}`, h.body).w_full().min_w(0).text_size(12).line_height(1.6).selectable(true))
+      .child(div().text_size(10).text_color(secondary).truncate().tooltip(h.branch ?? "").child(h.branch || "(no branch)"))
+      .child(div().text_size(10).text_color(secondary).truncate()
+        .tooltip(h.provider ? `${h.provider}/${h.model}` : "human").child(h.provider ? `${h.provider}/${h.model}` : "human")));
+    detail.child(v_flex().border_t(1).border_color(t.border).pt(8).gap(3).min_w(0).text_size(10).text_color(secondary)
+      .child(div().child("Created in"))
+      .child(div().truncate().tooltip(x.created_branch ?? "")
+        .child(x.created_branch ?? (x.created_worktree ? "(detached HEAD)" : "Unknown")))
+      .when(Boolean(x.created_worktree), el => el.child(div().truncate()
+        .tooltip(x.created_worktree).child(x.created_worktree))));
+    if (x.parent_ref) detail.child(button(t, `tk-parent-${x.ref}`, `↑ Parent · ${x.parent_ref}`, false, () => this.openTicket(x.parent_ref)));
+    if (!x.parent_ref) {
+      detail.child(h_flex().items_center().gap(6)
+        .child(div().flex_1().text_size(11).text_color(secondary).child(`Subtasks · ${x.children?.length ?? 0}`))
+        .child(button(t, `tk-child-new-${x.ref}`, "+ Add subtask", false, () => this.openNewTicket(x))));
+      const outside = (x.children ?? []).filter(child => !this.visibleRefs.has(child.ref));
+      if (!this.pinnedRef && outside.length) detail.child(div().text_size(10).text_color(secondary).child("Outside this list"));
+      for (const child of outside) detail.child(
+        Button.new(`tk-child-${child.ref}`).tab_index(0).relative().w_full().min_w(0).p(7).pl(10).rounded(4).border_t(1).border_color(t.border)
+          .hover(el => el.bg(t.hover)).focus(el => el.bg(t.hover)).cursor_pointer()
+          .on_click(() => this.openTicket(child.ref))
+          .when(Boolean(child.priority), el => el.child(div().absolute().left(2).top(7).bottom(7).w(3).rounded(2)
+            .bg(priorityColor(child.priority, this.dark))))
+          .child(v_flex().gap(3).min_w(0)
+            .child(h_flex().gap(6).child(div().font_semibold().child(child.ref))
+              .child(div().text_color(secondary).child(child.status.replace(/_/g, " ")))
+              .when(Boolean(child.priority), el => el.child(priorityMark(t, child.priority, this.dark))))
+            .child(div().whitespace_normal().child(child.title))));
+    }
     return card.child(detail);
   }
 }
+function iconButton(t, id, asset, label, action) {
+  return Button.new(id).tab_index(0).size(26).flex_none().items_center().justify_center().rounded(6)
+    .text_color(t.dim ?? t.muted ?? t.foreground).cursor_pointer().tooltip(label).accessibility_label(label)
+    .hover(el => el.bg(t.hover).text_color(t.foreground)).focus(el => el.bg(t.hover))
+    .on_click(action).child(svg(asset).size(14));
+}
+
 
 function button(t, id, text, primary, action) {
   return Button.new(id).tab_index(0).h(32).px(9).items_center().rounded(5).border_1()
@@ -516,12 +571,14 @@ class TagPicker {
 class NewTicket {
   init(input, cx) {
     const p = input ?? props() ?? {};
+    bindComposerKeys(cx);
     this.root = p.root;
     this.slug = p.slug;
     this.parentRef = p.parent_ref ?? null;
     this.parentTitle = p.parent_title ?? null;
     this.msg = null;
     this.busy = false;
+    this.priority = null;
     this.title = InputState.new({ placeholder: "What needs doing" });
     this.disposed = false;
     this.overlay = p.overlay ?? props()?.overlay;
@@ -556,6 +613,7 @@ class NewTicket {
     }
     const body = this.body.value();
     const tags = this.tags.names().join(",");
+    const priority = this.priority;
     const isTemplate = body.replace(/\s+/g, " ").trim() === BODY_TEMPLATE.replace(/\s+/g, " ").trim();
     this.busy = true;
     this.tags.busy = true;
@@ -563,7 +621,7 @@ class NewTicket {
     cx.notify();
     cx.spawn(async (acx) => {
       try {
-        await tk(["new", title, `--tags=${tags}`, ...(this.parentRef ? ["--parent", this.parentRef] : []), ...(isTemplate ? [] : ["--body", body])], this.root);
+        await tk(["new", title, `--tags=${tags}`, `--priority=${priority ?? ""}`, ...(this.parentRef ? ["--parent", this.parentRef] : []), ...(isTemplate ? [] : [`--body=${body}`])], this.root);
         this.close();
       } catch (e) {
         this.busy = false;
@@ -577,7 +635,6 @@ class NewTicket {
 
   key(e, cx) {
     if (e.key === "escape") { if (!this.busy) this.close(); }
-    else if (e.key === "enter" && e.modifiers.platform) this.submit(cx);
     else return;
     cx.stop_propagation();
   }
@@ -588,6 +645,8 @@ class NewTicket {
     return v_flex()
       .id("tk-new-ticket")
       .track_focus(this.handle)
+      .key_context("HerdrTicketCompose")
+      .on_action("herdr-ticket-submit", (_e, cx) => { this.submit(cx); cx.stop_propagation(); })
       .on_key_down((e, cx) => this.key(e, cx))
       .size_full()
       .p(18)
@@ -607,6 +666,10 @@ class NewTicket {
         .child(`Parent: ${this.parentRef} · ${this.parentTitle ?? ""}`)))
       .child(label("Title"))
       .child(Input.new(this.title).h(34).px(10).rounded(7).border_1().border_color(t.input).bg(t.background).text_size(13))
+      .child(label("Priority · optional"))
+      .child(priorityChoices(t, "tk-new-priority", this.priority, this.busy, (value, cx) => {
+        if (!this.busy) { this.priority = value; cx.notify(); }
+      }, isDarkBackground(t.background)))
       .child(label("Tags · optional"))
       .child(this.tags.render(t))
       .child(label("Description"))
@@ -620,6 +683,116 @@ class NewTicket {
           .child(button(t, "tk-new-cancel", "Cancel", false, () => this.close()).disabled(this.busy))
           .child(button(t, "tk-new-issue", this.busy ? "Issuing…" : "Issue", true, (_e, cx) => this.submit(cx)).disabled(this.busy)),
       );
+  }
+}
+
+class EditTicket {
+  init(input, cx) {
+    const p = input ?? props() ?? {};
+    bindComposerKeys(cx);
+    this.root = p.root;
+    this.ref = p.ref;
+    this.overlay = p.overlay ?? props()?.overlay;
+    this.loading = true;
+    this.busy = false;
+    this.disposed = false;
+    this.original = null;
+    this.error = null;
+    this.title = InputState.new({ placeholder: "What needs doing" });
+    this.body = TextareaState.new({ rows: 14 });
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+    this.title.on("submit", () => { if (!this.busy) this.body.focus(); });
+    for (const field of [this.title, this.body]) field.on("change", (_e, acx) => {
+      this.error = null;
+      acx.notify();
+    });
+    cx.spawn(async acx => {
+      try {
+        const ticket = await tk(["show", this.ref, "--latest-handoff"], this.root);
+        if (this.disposed) return;
+        this.original = { title: ticket.title, body: ticket.body };
+        this.title.set_value(ticket.title);
+        this.body.set_value(ticket.body);
+        this.title.focus();
+        acx.timer.after(300, () => { if (!this.disposed) this.title.focus(); });
+      } catch (error) {
+        if (this.disposed) return;
+        this.error = `Load failed: ${String(error?.message ?? error)}`;
+      } finally {
+        this.loading = false;
+        if (!this.disposed) acx.notify();
+      }
+    });
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.title.release();
+    this.body.release();
+    this.handle.release();
+  }
+
+  close() {
+    if (!this.busy) closeOverlay(this.overlay);
+  }
+
+  submit(cx) {
+    if (this.loading || this.busy || this.disposed || !this.original) return;
+    const title = this.title.value().trim(), body = this.body.value();
+    if (!title) {
+      this.error = "A ticket needs a title";
+      cx.notify();
+      return;
+    }
+    const args = ["edit", this.ref];
+    if (title !== this.original.title) args.push(`--title=${title}`);
+    if (body !== this.original.body) args.push(`--body=${body}`);
+    if (args.length === 2) { this.close(); return; }
+    this.busy = true;
+    this.error = null;
+    cx.notify();
+    cx.spawn(async acx => {
+      try {
+        await tk(args, this.root, { attachSession: false });
+        if (!this.disposed) closeOverlay(this.overlay);
+      } catch (error) {
+        if (this.disposed) return;
+        this.busy = false;
+        this.error = `Save failed: ${String(error?.message ?? error)}`;
+        acx.notify();
+      }
+    });
+  }
+
+  render() {
+    const t = theme(), secondary = t.muted ?? t.foreground;
+    const root = v_flex().id("tk-edit-ticket").size_full().min_h(0).p(18).gap(10)
+      .bg(t.popover).text_color(t.foreground).text_size(12.5).track_focus(this.handle)
+      .key_context("HerdrTicketCompose")
+      .on_action("herdr-ticket-submit", (_e, cx) => { this.submit(cx); cx.stop_propagation(); })
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") this.close();
+        else return;
+        cx.stop_propagation();
+      })
+      .child(div().text_size(17).font_semibold().child(`Edit ticket · ${this.ref}`))
+      .child(div().text_size(10).text_color(secondary).truncate().tooltip(this.root).child((this.root ?? "").replace(home(), "~")));
+    if (this.loading) root.child(div().role("status").child("Loading ticket…"));
+    if (this.original) root
+      .child(div().text_size(11.5).text_color(secondary).child("Title"))
+      .child(Input.new(this.title).id("tk-edit-title").h(34).px(10).rounded(7).border_1()
+        .border_color(t.input).bg(t.background).text_size(13).disabled(this.busy).accessibility_label("Ticket title"))
+      .child(div().text_size(11.5).text_color(secondary).child("Description"))
+      .child(Textarea.new(this.body).id("tk-edit-body").flex_1().min_h(0).px(10).py(8).rounded(7).border_1()
+        .border_color(t.input).bg(t.background).text_size(12.5).disabled(this.busy).accessibility_label("Ticket description"));
+    else root.child(div().flex_1());
+    if (this.error) root.child(div().role("alert").text_size(12).whitespace_normal().child(this.error));
+    return root.child(h_flex().gap(8).items_center().pt(4)
+      .child(div().flex_1().min_w(0).text_size(11).text_color(secondary).child(this.busy ? "Saving…" : "⌘Enter to save · Esc to cancel"))
+      .child(button(t, "tk-edit-cancel", "Cancel", false, () => this.close()).disabled(this.busy))
+      .child(button(t, "tk-edit-save", this.busy ? "Saving…" : "Save", true, (_e, cx) => this.submit(cx))
+        .disabled(this.busy || this.loading || !this.original)));
   }
 }
 
@@ -741,9 +914,9 @@ class DeleteTicket {
   }
 }
 
-const ROLES = { new: NewTicket, tags: EditTags, delete: DeleteTicket, agent: AgentPicker, detail: TicketPanel };
+const ROLES = { new: NewTicket, edit: EditTicket, tags: EditTags, priority: PriorityEditor, delete: DeleteTicket, agent: AgentPicker, detail: TicketPanel, "label-runtime": SessionLabelRuntime };
 
-/** One mod: the repository panel and its new-ticket and deletion dialogs. */
+/** One mod: the repository panel and its ticket dialogs. */
 export default class HerdrTicket extends View {
   init(p, cx) {
     this.role?.dispose?.();

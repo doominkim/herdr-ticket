@@ -100,6 +100,28 @@ describe("content and author", () => {
     expect(t.body).toBe("## Goal\nLogin works\n");
   });
 
+  test("editing literal text flags preserves leading dashes and equals, and permits clearing only the body", () => {
+    sb = sandbox();
+    sb.json(["new", "상위 작업"]);
+    sb.json(["new", "기존 하위 작업", "--parent", "1", "--tags", "feat", "--body", "기존 본문"]);
+    sb.json(["status", "2", "in_review"]);
+    const body = "---\nkind: note\n---\n## 내용\n한글 = 값\n";
+    const saved = sb.tk(["edit", "2", "--title=--설정=값", `--body=${body}`]);
+    expect(saved.code).toBe(0);
+    const edited = sb.json(["show", "2"]);
+    expect([edited.title, edited.body, edited.status, edited.tags, edited.parent_ref]).toEqual([
+      "--설정=값", body, "in_review", ["feat"], "MAIN-1",
+    ]);
+    expect(sb.json(["edit", "2", "--body=-"], { stdin: "읽으면 안 되는 입력" }).body).toBe("-");
+    expect(sb.json(["edit", "2", "--body=기존 값", "--body", "-"], { stdin: "표준 입력 본문" }).body).toBe("표준 입력 본문");
+    expect(sb.json(["edit", "2", "--body", "-", "--body=-"], { stdin: "읽으면 안 되는 입력" }).body).toBe("-");
+    sb.json(["edit", "2", "--title=수", "--body="]);
+    expect([sb.json(["show", "2"]).title, sb.json(["show", "2"]).body]).toEqual(["수", ""]);
+    expect(sb.tk(["edit", "2", "--title=   ", "--body=변경되면 안 됨"]).code).toBe(1);
+    const kept = sb.json(["show", "2"]);
+    expect([kept.title, kept.body, kept.status, kept.tags, kept.parent_ref]).toEqual(["수", "", "in_review", ["feat"], "MAIN-1"]);
+  });
+
   test("an agent records provider and model together", () => {
     sb = sandbox();
     const t = sb.json(["new", "By an agent", "--provider", "anthropic", "--model", "claude-opus-5-5", "--session", "s1"]);

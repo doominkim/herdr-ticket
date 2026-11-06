@@ -1,7 +1,14 @@
 import { div } from "gpui-kit";
 import { v_flex, h_flex, Button, InputState, Input } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, exec, hc, run, home, theme, props, closeOverlay } from "herdr";
+import { agents, knownAgents, terminals, panes, spaces, focused, exec, hc, run, home, theme, props, closeOverlay } from "herdr";
 import { tk } from "./commands.js";
+import { buildAgentCommand } from "./agent-launch.js";
+
+const launchers = [
+  { id: "claude", name: "Claude Code" },
+  { id: "codex", name: "Codex" },
+  { id: "omp", name: "Oh My Pi" },
+];
 
 const slug = (branch) => branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 const message = (error) => String(error?.message ?? error);
@@ -26,7 +33,7 @@ async function repository(cwd) {
 function button(t, id, label, action, selected = false) {
   return Button.new(id).tab_index(0).px(10).py(8).rounded(6).border_1()
     .border_color(selected ? t.accent : t.border).bg(selected ? t.selected : t.raised)
-    .text_color(t.foreground).text_size(12).cursor_pointer()
+    .text_color(t.foreground).text_size(13).cursor_pointer()
     .hover(el => el.border_color(t.accent)).focus(el => el.border_color(t.accent))
     .on_click(action).child(label);
 }
@@ -52,11 +59,40 @@ export class AgentPicker {
     this.created = null;
     this.worktreeAttempt = null;
     this.pending = null;
+    this.launcher = "claude";
+    this.registered = [];
+    this.launcherError = null;
+    this.registeredLoaded = false;
+    this.models = Object.fromEntries(launchers.map(({ id }) => {
+      const state = InputState.new({ value: "", placeholder: "Blank uses launcher default" });
+      state.on("change", () => {
+        if (this.disposed) return;
+        if (!this.busy && !this.pending && !this.worktreeAttempt) this.error = null;
+        cx.notify();
+      });
+      state.on("submit", () => this.submit(cx));
+      return [id, state];
+    }));
     this.branch = InputState.new({ value: `ticket/${String(this.ref ?? "").toLowerCase()}`, placeholder: "ticket/my-branch" });
-    this.branch.on("change", (_e, acx) => { if (!this.busy) this.error = null; acx.notify(); });
-    this.branch.on("submit", (_e, acx) => this.submit(acx));
+    this.branch.on("change", () => {
+      if (this.disposed) return;
+      if (!this.busy && !this.pending && !this.worktreeAttempt) this.error = null;
+      cx.notify();
+    });
+    this.branch.on("submit", () => this.submit(cx));
     this.handle = cx.focus_handle();
     this.handle.focus();
+    cx.spawn(async acx => {
+      try {
+        const registered = await knownAgents({ on: null });
+        if (this.disposed) return;
+        this.registered = registered;
+      } catch (error) {
+        if (!this.disposed) this.launcherError = `Could not read registered agent launchers: ${message(error)}`;
+      } finally {
+        if (!this.disposed) { this.registeredLoaded = true; acx.notify(); }
+      }
+    });
     cx.spawn(async acx => {
       try {
         this.localSpace();
@@ -132,6 +168,16 @@ export class AgentPicker {
     return `${home()}/.herdr/worktrees/${name}/${slug(branch)}`;
   }
 
+  registration() {
+    if (!this.registeredLoaded) throw new Error("Registered agent launchers are still loading.");
+    if (this.launcherError) throw new Error(this.launcherError);
+    const name = launchers.find(item => item.id === this.launcher).name;
+    const registered = this.registered.find(item => item.run?.[0]?.split("/").pop() === this.launcher);
+    if (!registered) throw new Error(`${name} has no supported registered executable. Register its CLI before starting a new session.`);
+    if (!registered.installed) throw new Error(`${name} is not installed. Install its registered CLI before starting a new session.`);
+    return registered;
+  }
+
   choose(mode, address, cx) {
     if (this.busy || this.pending || this.worktreeAttempt) return;
     this.mode = mode;
@@ -166,17 +212,18 @@ export class AgentPicker {
 
   async launch(cwd) {
     this.localSpace();
-    if (!this.pending) this.pending = { cwd, tab: tabId(), address: null, attempted: false, linked: false };
+    if (!this.pending) throw new Error("No captured agent launch is available. Reopen this dialog.");
     const pending = this.pending;
     if (pending.cwd !== cwd) throw new Error("Continue with the already-created destination.");
     if (pending.address) return pending;
     if (pending.attempted) throw new Error("The launch result is unknown. Inspect the reported tab before starting another agent.");
     pending.attempted = true;
-    const prompt = `Continue ticket ${this.ref}. First read it and its latest handoff with \`tk show ${this.ref} --latest-handoff\`.`;
+    if (this.disposed) return pending;
     const result = await hc([
       "run", "--bg", "--json", "--no-parent", "--keep", "--cwd", cwd,
-      "--label", `herdr.space=${this.space}`, "--label", `herdr.tab=${pending.tab}`, "--", "claude", prompt,
+      "--label", `herdr.space=${this.space}`, "--label", `herdr.tab=${pending.tab}`, "--", ...pending.argv,
     ]);
+    if (this.disposed) return pending;
     try {
       const address = JSON.parse(result.stdout).address;
       if (typeof address === "string" && address && !address.includes("/")) pending.address = address;
@@ -190,34 +237,60 @@ export class AgentPicker {
     if (this.busy || this.loading || !this.repo || this.disposed) return;
     const mode = this.mode, selected = this.selected, branch = this.branch.value().trim();
     if (mode === "existing" && !selected) return;
+    let argv = this.pending?.argv;
+    if (mode !== "existing" && !argv) {
+      try {
+        argv = buildAgentCommand(this.registration().run, this.models[this.launcher].value(),
+          `Continue ticket ${this.ref}. First read it and its latest handoff with \`tk show ${this.ref} --latest-handoff\`.`);
+      } catch (error) {
+        this.error = message(error);
+        cx.notify();
+        return;
+      }
+    }
+    if (mode !== "existing" && !this.pending) {
+      this.pending = {
+        cwd: mode === "worktree" ? this.path(branch) : this.root,
+        argv, tab: tabId(), address: null, attempted: false, linked: false,
+      };
+    }
     this.busy = true;
     this.error = null;
     cx.notify();
     cx.spawn(async acx => {
       try {
         await this.source();
+        if (this.disposed) return;
         if (mode === "existing") {
           const target = await this.existing(selected);
+          if (this.disposed) return;
           await tk(["link", this.ref, "--terminal", target.address], this.root);
+          if (this.disposed) return;
           await this.existing(target.address);
+          if (this.disposed) return;
           // Linking/focusing never sends input, including to working or blocked agents.
           run("agent.focus", { terminal: target.address });
         } else {
           const cwd = mode === "worktree" ? await this.worktree(branch) : this.root;
+          if (this.disposed) return;
           const pending = await this.launch(cwd);
+          if (this.disposed) return;
           this.localSpace();
           if (!pending.linked) {
             await tk(["link", this.ref, "--terminal", pending.address], this.root);
+            if (this.disposed) return;
             pending.linked = true;
           }
           await acx.sleep(800); // The app adopts the labeled core terminal into its new tab.
+          if (this.disposed) return;
           this.localSpace();
-          run("tab.rename", { id: pending.tab, name: `${this.ref} ${this.title}`.slice(0, 40) });
+          run("tab.rename", { id: pending.tab, name: this.title.slice(0, 40) });
           run("pane.focus", { terminal: pending.address });
         }
         this.close();
       } catch (error) {
         this.error = message(error);
+        if (this.pending && !this.pending.attempted && !this.worktreeAttempt) this.pending = null;
       } finally {
         this.busy = false;
         if (!this.disposed) acx.notify();
@@ -232,16 +305,21 @@ export class AgentPicker {
   dispose() {
     this.disposed = true;
     this.branch.release();
+    for (const state of Object.values(this.models)) state.release();
     this.handle.release();
   }
 
   render() {
-    const t = theme(), muted = t.muted ?? t.foreground;
+    const t = theme(), muted = t.dim ?? t.muted ?? t.foreground;
     const locked = this.busy || Boolean(this.pending || this.worktreeAttempt);
+    let unavailable = false;
+    if (this.mode !== "existing" && !this.pending) {
+      try { this.registration(); } catch { unavailable = true; }
+    }
     const uncertain = this.pending?.attempted && !this.pending.address;
     const failedWorktree = this.worktreeAttempt && !this.created;
     const root = v_flex().id("tk-agent-picker").size_full().min_h(0).p(20).gap(12)
-      .bg(t.popover).text_color(t.foreground).text_size(12).track_focus(this.handle)
+      .bg(t.popover).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((event, cx) => {
         if (event.key === "escape") { if (!this.busy) this.close(); cx.stop_propagation(); }
         else if (event.key === "enter" && event.modifiers.platform) { this.submit(cx); cx.stop_propagation(); }
@@ -250,7 +328,7 @@ export class AgentPicker {
       .child(div().text_size(13).truncate().tooltip(this.title).child(this.title))
       .child(div().text_size(11).text_color(muted).truncate().tooltip(this.root).child(this.root ?? ""));
     const body = v_flex().id("tk-agent-destinations").flex_1().min_h(0).gap(8).overflow_y_scrollbar();
-    body.child(div().font_semibold().child("Existing agents · this repository"));
+    body.child(div().font_medium().text_size(11.5).text_color(muted).child("Existing agents · this repository"));
     if (this.loading) body.child(div().text_color(muted).child("Checking repository and live agents…"));
     else if (!this.list.length) body.child(div().text_color(muted).child("No live local agents with a known repository folder."));
     for (const candidate of this.list) {
@@ -259,7 +337,28 @@ export class AgentPicker {
         (_event, cx) => this.choose("existing", candidate.address, cx), this.mode === "existing" && this.selected === candidate.address)
         .disabled(locked).tooltip(candidate.cwd));
     }
-    body.child(div().pt(8).font_semibold().child("Start Claude Code"));
+    body.child(div().pt(8).font_medium().text_size(11.5).text_color(muted).child("Start a new agent"));
+    if (this.mode !== "existing") {
+      const choices = h_flex().gap(6);
+      for (const { id, name } of launchers) choices.child(
+        button(t, `tk-agent-launcher-${id}`, name, (_event, cx) => {
+          if (this.disposed || this.busy || this.pending || this.worktreeAttempt) return;
+          this.launcher = id;
+          this.error = null;
+          cx.notify();
+        }, this.launcher === id).disabled(locked).tooltip(`Use the registered ${name} launcher`));
+      body.child(choices);
+      body.child(div().child("Model ID"));
+      body.child(Input.new(this.models[this.launcher]).h(34).px(10).rounded(6).border_1().border_color(t.input).bg(t.background)
+        .disabled(locked).accessibility_label(`${launchers.find(item => item.id === this.launcher).name} model ID`)
+        .tooltip("Enter an exact model ID; leave blank to keep the registered launcher or CLI default."));
+      body.child(div().text_size(11).text_color(muted).whitespace_normal()
+        .child("Blank keeps the registered launcher or CLI default. Oh My Pi: use provider/model for an exact choice."));
+      if (!this.registeredLoaded) body.child(div().role("status").text_size(11).text_color(muted).child("Checking registered agent launchers…"));
+      else try { this.registration(); } catch (error) {
+        body.child(div().role("alert").text_size(11).whitespace_normal().child(message(error)));
+      }
+    }
     body.child(button(t, "tk-agent-new-tab", "New Herdr tab · original repository", (_event, cx) => this.choose("new", null, cx), this.mode === "new").disabled(locked));
     body.child(button(t, "tk-agent-new-worktree", "New worktree + Herdr tab", (_event, cx) => this.choose("worktree", null, cx), this.mode === "worktree").disabled(locked));
     if (this.mode === "worktree") {
@@ -273,12 +372,12 @@ export class AgentPicker {
     root.child(body);
     if (this.worktreeAttempt) root.child(div().text_size(11).whitespace_normal().child(`${this.created ? "Created worktree" : "Worktree creation attempted"}: ${this.worktreeAttempt}`));
     if (this.pending) root.child(div().text_size(11).whitespace_normal()
-      .child(`${this.pending.address ? `Created session: ${this.pending.address}` : "Launch attempted; result may be unknown"} · tab ${this.pending.tab}`));
+      .child(`${this.pending.address ? `Created session: ${this.pending.address}` : this.pending.attempted ? "Launch attempted; result may be unknown" : "Captured launch destination"} · tab ${this.pending.tab}`));
     if (this.error) root.child(div().role("alert").text_size(12).whitespace_normal().child(this.error));
     root.child(div().text_size(11).text_color(muted).whitespace_normal().child("Existing agents receive no prompt. Linking or launching does not change ticket status."));
     return root.child(h_flex().gap(8).justify_end()
       .child(button(t, "tk-agent-cancel", "Cancel", () => this.close()).disabled(this.busy))
       .child(button(t, "tk-agent-go", this.busy ? "Opening…" : this.pending?.address || this.created ? "Continue" : "Go", (_event, cx) => this.submit(cx), true)
-        .disabled(this.busy || this.loading || !this.repo || Boolean(uncertain || failedWorktree))));
+        .disabled(this.busy || this.loading || !this.repo || unavailable || Boolean(uncertain || failedWorktree))));
   }
 }
